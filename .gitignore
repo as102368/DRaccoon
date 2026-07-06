@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build outputs
+dist/
+build/
+out/
+
+# Environment and secrets
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+logs/
+
+# User data and runtime files
+userdata/
+userData/
+*.db
+*.sqlite
+*.sqlite3
+
+# Test outputs
+test_download_output/
+test_sync_output/
+test_*_output.txt
+
+# Screenshots and temporary images
+test_*.png
+*.tmp
+
+# IDE / Editor
+.trae/
+.vscode/
+.idea/
+
+# Debug
+.dbg/

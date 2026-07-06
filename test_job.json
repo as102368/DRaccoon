@@ -1,0 +1,21 @@
+{
+  "urls": ["https://www.douyin.com/video/1234567890123456789"],
+  "config": {
+    "path": "C:\\Users\\EDY\\Downloads\\DouyinTest",
+    "thread": 2,
+    "retry_times": 1,
+    "proxy": "",
+    "database": false,
+    "cover": false,
+    "music": false,
+    "avatar": false,
+    "json": false,
+    "folderstyle": true,
+    "filename_template": "{date}_{title}_{id}",
+    "folder_template": "{date}_{title}_{id}",
+    "author_dir": "nickname",
+    "download_pinned": false,
+    "progress": {"quiet_logs": true}
+  },
+  "cookies": {}
+}

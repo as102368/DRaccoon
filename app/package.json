@@ -1,0 +1,8 @@
+{
+  "name": "douzy-electron",
+  "version": "1.0.0",
+  "description": "DRaccoon Electron 前端复刻",
+  "main": "main.js",
+  "author": "",
+  "license": "MIT"
+}

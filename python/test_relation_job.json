@@ -1,0 +1,1 @@
+{"task_type":"relation","action":"follow","secUids":["MS4wLjABAAAAxx","MS4wLjABAAAAyy"],"cookies":"passport_csrf_token=abc123; sessionid=xyz789","config":{"minDelay":0.1,"maxDelay":0.2,"dryRun":true},"proxy":""}
