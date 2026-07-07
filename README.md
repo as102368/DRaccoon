@@ -24,19 +24,10 @@ D:\DOU\douzy-electron
 
 ## 运行方式
 
-直接双击 `start.bat`，或在 PowerShell 中执行：
-
-```powershell
-D:\DOU\douzy-electron\electron\electron.exe D:\DOU\douzy-electron\app
-```
+直接双击 `start.bat`
 
 ## 已实现页面
 
 - **关注**：完整复刻截图中的列表、搜索、排序、筛选、分页、下载按钮。
 - **收藏 / 下载 / 批量下载 / 任务中心 / 作品档案 / 设置**：已接入侧边栏导航，页面为占位状态，等待后续功能对接。
 
-## 说明
-
-- 当前为纯前端模拟数据，未对接任何网络验证或下载逻辑。
-- 在线验证、激活、邀请码等功能均已移除，仅保留 UI 占位。
-- 如需对接 `D:\DOU\douyin-downloader` 后端，可在 `preload.js` / `main.js` 中扩展 IPC，调用 Python 下载器或 REST API。
