@@ -27,12 +27,8 @@ async def main():
     print("cookie keys:", list(cookies.keys()))
     print("sessionid:", cookies.get("sessionid", "")[:20], "...")
 
-    # 从 cookie 里提取当前登录用户的 sec_uid
-    follow_info = cookies.get("FOLLOW_NUMBER_YELLOW_POINT_INFO", "")
-    sec_uid = ""
-    if follow_info:
-        decoded = unquote(follow_info).strip('"')
-        sec_uid = decoded.split("/")[0]
+    # 测试：使用数据库中“茄子酱”的 sec_uid
+    sec_uid = "MS4wLjABAAAApf_0GDlvcTOMZtRcYIf4UL189EVR3ausoUoo2pIFGJFepEj75q9U55ynmC1YQvEb"
     print("test sec_uid:", sec_uid)
 
     if not sec_uid:

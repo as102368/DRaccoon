@@ -474,6 +474,7 @@ store.onFinished = (payload) => {
 // ========== 同步任务 ==========
 store.startSync = (kind) => {
   const id = 'sync-' + kind + '-' + Date.now();
+  const now = Date.now();
   const sync = reactive({
     id,
     kind,
@@ -483,7 +484,9 @@ store.startSync = (kind) => {
     total: 0,
     added: 0,
     logs: [],
-    createdAt: new Date().toLocaleString(),
+    createdAt: new Date(now).toLocaleString(),
+    createdAtMs: now,
+    lastProgressAt: now,
   });
   store.syncs.unshift(sync);
   window.electronAPI.startSync({
@@ -508,6 +511,7 @@ store.onSyncProgress = (payload) => {
   const { syncId, data } = payload;
   const sync = store.syncs.find(s => s.id === syncId);
   if (!sync) return;
+  sync.lastProgressAt = Date.now();
   if (data.event === 'sync_start') {
     sync.step = '开始同步';
     sync.total = data.limit || 0;
@@ -564,6 +568,19 @@ store.onSyncFinished = async (payload) => {
   await store.loadSyncCache(kind);
 };
 
+store.recoverStalledSyncs = () => {
+  const now = Date.now();
+  const STALL_TIMEOUT_MS = 5 * 60 * 1000;
+  for (const sync of store.syncs) {
+    if (sync.status !== 'running' && sync.status !== 'cancelling') continue;
+    const last = sync.lastProgressAt || sync.createdAtMs || now;
+    if (now - last > STALL_TIMEOUT_MS) {
+      sync.status = 'error';
+      sync.step = '同步卡住，请重新尝试';
+    }
+  }
+};
+
 store.loadSyncCache = async (kind) => {
   const cache = await window.electronAPI.getSyncCache(kind);
   store.syncCache[kind] = cache;
@@ -577,8 +594,12 @@ store.clearSyncCache = async (kind) => {
 };
 
 // ========== 博主作品列表任务 ==========
-store.startUserWorks = (secUid, nickname) => {
+const USER_WORKS_STALL_MS = 30000;
+
+store.startUserWorks = async (secUid, nickname) => {
   const id = 'userWorks-' + secUid + '-' + Date.now();
+  // 清理该作者已结束的历史任务，避免列表无限增长并防止旧空任务干扰判断
+  store.userWorks = store.userWorks.filter(t => !(t.secUid === secUid && t.status !== 'running' && t.status !== 'cancelling'));
   const task = reactive({
     id,
     secUid,
@@ -590,16 +611,30 @@ store.startUserWorks = (secUid, nickname) => {
     step: '准备中',
     logs: [],
     createdAt: new Date().toLocaleString(),
+    lastProgressAt: Date.now(),
   });
   store.userWorks.unshift(task);
-  window.electronAPI.startUserWorks({
-    taskId: id,
-    secUid,
-    nickname: nickname || secUid,
-    cookies: store.settings.cookieString,
-    limit: store.settings.syncLimits.following || 200,
-    proxy: store.settings.proxy || '',
-  });
+  try {
+    const result = await window.electronAPI.startUserWorks({
+      taskId: id,
+      secUid,
+      nickname: nickname || secUid,
+      cookies: store.settings.cookieString,
+      limit: store.settings.syncLimits.following || 200,
+      proxy: store.settings.proxy || '',
+    });
+    if (!result || result.started === false) {
+      task.status = 'error';
+      task.step = `启动失败：${result && result.error ? result.error : '未知错误'}`;
+      console.error('[userWorks] start failed', result);
+    } else {
+      task.step = '等待后端响应';
+    }
+  } catch (err) {
+    task.status = 'error';
+    task.step = `启动失败：${err && err.message ? err.message : err}`;
+    console.error('[userWorks] start exception', err);
+  }
   return id;
 };
 
@@ -611,10 +646,24 @@ store.cancelUserWorks = (id) => {
   }
 };
 
+store.isUserWorksRunning = (secUid) => {
+  const task = store.userWorks.find(t => t.secUid === secUid && t.status === 'running');
+  if (!task) return false;
+  const stalled = Date.now() - (task.lastProgressAt || Date.now()) > USER_WORKS_STALL_MS;
+  if (stalled) {
+    task.status = 'error';
+    task.step = '获取超时，请重试';
+    return false;
+  }
+  return true;
+};
+
 store.onUserWorksProgress = (payload) => {
   const { taskId, data } = payload;
   const task = store.userWorks.find(t => t.id === taskId);
   if (!task) return;
+  task.lastProgressAt = Date.now();
+  console.log('[userWorks]', taskId, data.event, data.items?.length ?? data.total ?? '');
   if (data.event === 'start') {
     task.step = '开始获取作品';
     task.total = data.limit || 0;
@@ -624,12 +673,13 @@ store.onUserWorksProgress = (payload) => {
       task.progress = Math.min(100, Math.round((data.current / task.total) * 100));
     }
   } else if (data.event === 'items') {
-    task.items.push(...(data.items || []));
+    const items = Array.isArray(data.items) ? data.items : [];
+    task.items.push(...items);
     task.total = data.total || task.total;
   } else if (data.event === 'done') {
     task.step = `共 ${data.total || task.items.length} 个作品`;
     task.progress = 100;
-    if (data.items) task.items = data.items;
+    if (Array.isArray(data.items)) task.items = data.items;
   } else if (data.event === 'log') {
     task.logs.push(data.message || '');
   }
@@ -1213,9 +1263,22 @@ const PageFollowing = {
   setup() {
     const s = inject('store');
     const search = ref('');
-    const sortBy = ref('follow-time');
+    const sortBy = ref('recent');
     const sortOrder = ref('desc');
     const sortOpen = ref(false);
+
+    // 抖音原生的关注列表排序（最近/最早）；其余为管理排序
+    const douyinSortKeys = new Set(['recent', 'earliest']);
+    function defaultOrderFor(key) {
+      if (key === 'earliest') return 'asc';
+      if (key === 'name') return 'asc';
+      return 'desc';
+    }
+    function arrowFor(key, order) {
+      if (key === 'earliest') return '↑';
+      if (douyinSortKeys.has(key)) return '↓';
+      return order === 'desc' ? '↓' : '↑';
+    }
     const filterTag = ref('all');
     const page = ref(1);
     const pageSize = ref(10);
@@ -1223,29 +1286,34 @@ const PageFollowing = {
     const multiSelect = ref(false);
     const selected = ref(new Set());
     const showMore = ref(null);
+    const moreMenuStyle = ref({});
     const remarkInput = ref({ sec_uid: '', value: '' });
     const remarks = ref(loadFollowingRemarks());
     const unfollowed = ref(loadUnfollowedSet());
 
     const sortOptions = [
-      { key: 'follow-time', label: '关注时间' },
-      { key: 'fans', label: '粉丝数' },
-      { key: 'works', label: '作品数' },
-      { key: 'name', label: '昵称' },
+      { key: 'recent', label: '最近关注', divider: false },
+      { key: 'earliest', label: '最早关注', divider: true },
+      { key: 'fans', label: '粉丝数', divider: false },
+      { key: 'works', label: '作品数', divider: false },
+      { key: 'name', label: '昵称', divider: false },
     ];
 
     const sortLabel = computed(() => {
       const opt = sortOptions.find(o => o.key === sortBy.value);
-      const arrow = sortOrder.value === 'desc' ? '↓' : '↑';
-      return `${opt ? opt.label : sortBy.value} ${arrow}`;
+      const arrow = arrowFor(sortBy.value, sortOrder.value);
+      return `${opt ? opt.label : sortBy.value}${douyinSortKeys.has(sortBy.value) ? '' : ' ' + arrow}`;
     });
 
     function toggleSort(key) {
-      if (sortBy.value === key) {
+      if (douyinSortKeys.has(key)) {
+        sortBy.value = key;
+        sortOrder.value = defaultOrderFor(key);
+      } else if (sortBy.value === key) {
         sortOrder.value = sortOrder.value === 'desc' ? 'asc' : 'desc';
       } else {
         sortBy.value = key;
-        sortOrder.value = key === 'name' ? 'asc' : 'desc';
+        sortOrder.value = defaultOrderFor(key);
       }
       sortOpen.value = false;
     }
@@ -1257,8 +1325,18 @@ const PageFollowing = {
       }
     }
 
-    onMounted(() => document.addEventListener('mousedown', closeSortDropdown));
-    onUnmounted(() => document.removeEventListener('mousedown', closeSortDropdown));
+    function closeMoreOnScroll() { closeMore(); }
+
+    onMounted(() => {
+      document.addEventListener('mousedown', closeSortDropdown);
+      document.addEventListener('scroll', closeMoreOnScroll, true);
+      window.addEventListener('resize', closeMoreOnScroll);
+    });
+    onUnmounted(() => {
+      document.removeEventListener('mousedown', closeSortDropdown);
+      document.removeEventListener('scroll', closeMoreOnScroll, true);
+      window.removeEventListener('resize', closeMoreOnScroll);
+    });
 
     const filterOptions = [
       { key: 'all', label: '全部' },
@@ -1282,8 +1360,9 @@ const PageFollowing = {
           following: u.following_count || 0,
           fans: u.follower_count || 0,
           works: u.video_count || u.aweme_count || 0,
-          followTime: u.create_time || 0,
-          followOrder: idx,
+          // 旧缓存可能没有 follow_order，用数组下标兜底保证排序仍可工作；
+          // 重新同步后会写入真实的 follow_order。
+          followOrder: u.follow_order != null ? u.follow_order : idx,
           remark: remarks.value[u.sec_uid] || '',
           isUnfollowed: unfollowed.value.has(u.sec_uid),
           downloadStatus: dl.status,
@@ -1314,14 +1393,12 @@ const PageFollowing = {
         list = list.filter(u => u.isUnfollowed);
       }
       list.sort((a, b) => {
-        const aTime = a.followTime || 0;
-        const bTime = b.followTime || 0;
-        if (sortBy.value === 'follow-time') {
-          if (aTime && bTime) {
-            return sortOrder.value === 'desc' ? bTime - aTime : aTime - bTime;
-          }
-          // Fallback to list order (API returns newest first) for legacy data without create_time.
-          return sortOrder.value === 'desc' ? b.followOrder - a.followOrder : a.followOrder - b.followOrder;
+        // 抖音原生的关注顺序：follow_order 越小代表越新关注
+        if (sortBy.value === 'recent') {
+          return (a.followOrder ?? Infinity) - (b.followOrder ?? Infinity);
+        }
+        if (sortBy.value === 'earliest') {
+          return (b.followOrder ?? Infinity) - (a.followOrder ?? Infinity);
         }
         if (sortBy.value === 'fans') {
           return sortOrder.value === 'desc'
@@ -1414,13 +1491,25 @@ const PageFollowing = {
     watch(worksSearch, () => { worksPage.value = 1; });
 
     function openUserWorks(user) {
-      if (!user || !user.sec_uid) return;
+      if (!user || !user.sec_uid) {
+        console.warn('[openUserWorks] missing user or sec_uid', user);
+        return;
+      }
       userWorksModal.value = { open: true, secUid: user.sec_uid, nickname: user.nickname, avatar: user.avatar };
       worksSearch.value = '';
       worksPage.value = 1;
       const existing = s.userWorks.find(t => t.secUid === user.sec_uid && (t.status === 'success' || t.status === 'running'));
       if (!existing) {
+        console.log('[openUserWorks] no existing task, starting', user.sec_uid);
         s.startUserWorks(user.sec_uid, user.nickname);
+      } else if (existing.status === 'success' && (!existing.items || existing.items.length === 0)) {
+        console.log('[openUserWorks] existing success task empty, restarting', user.sec_uid);
+        s.startUserWorks(user.sec_uid, user.nickname);
+      } else if (existing.status === 'running' && !s.isUserWorksRunning(user.sec_uid)) {
+        console.log('[openUserWorks] existing task stalled, restarting', user.sec_uid);
+        s.startUserWorks(user.sec_uid, user.nickname);
+      } else {
+        console.log('[openUserWorks] using existing task', existing.id, existing.status, existing.items?.length);
       }
     }
     function closeUserWorks() {
@@ -1463,9 +1552,42 @@ const PageFollowing = {
 
     function toggleMore(secUid, event) {
       event.stopPropagation();
-      showMore.value = showMore.value === secUid ? null : secUid;
+      if (showMore.value === secUid) {
+        showMore.value = null;
+        moreMenuStyle.value = {};
+        return;
+      }
+      showMore.value = secUid;
+      const btn = event.currentTarget;
+      const rect = btn.getBoundingClientRect();
+      const gap = 6;
+      // 先在按钮下方隐藏渲染，测量真实高度后再定位，避免初始位置闪一下
+      moreMenuStyle.value = {
+        top: `${rect.bottom + gap}px`,
+        left: `${Math.max(4, rect.right - 150)}px`,
+        visibility: 'hidden',
+      };
+      nextTick(() => {
+        const menu = document.querySelector('.more-menu');
+        if (!menu) return;
+        const menuRect = menu.getBoundingClientRect();
+        let top = rect.bottom + gap;
+        // 下方放不下则翻到按钮上方
+        if (top + menuRect.height > window.innerHeight - 4) {
+          top = rect.top - menuRect.height - gap;
+        }
+        // 防止超出顶部
+        if (top < 4) top = 4;
+        let left = rect.right - menuRect.width;
+        // 防止超出左右边界
+        if (left < 4) left = 4;
+        if (left + menuRect.width > window.innerWidth - 4) {
+          left = window.innerWidth - menuRect.width - 4;
+        }
+        moreMenuStyle.value = { top: `${top}px`, left: `${left}px`, visibility: 'visible' };
+      });
     }
-    function closeMore() { showMore.value = null; }
+    function closeMore() { showMore.value = null; moreMenuStyle.value = {}; }
 
     function openRemark(user) {
       remarkInput.value = { sec_uid: user.sec_uid, value: user.remark || '' };
@@ -1519,11 +1641,11 @@ const PageFollowing = {
     onUnmounted(() => { document.removeEventListener('click', closeMore); });
 
     return {
-      s, search, sortBy, sortOrder, sortOpen, sortOptions, sortLabel, toggleSort, filterTag, page, pageSize, viewMode, multiSelect,
+      s, search, sortBy, sortOrder, sortOpen, sortOptions, sortLabel, toggleSort, arrowFor, defaultOrderFor, filterTag, page, pageSize, viewMode, multiSelect,
       filterOptions, rawList, filteredList, totalPages, pagedList, sync, downloadUser, formatNumber, needsLogin,
       selected, selectedCount, allPageSelected, toggleSelect, selectAll, runRelation, unfollowUser,
       isSyncing, lastSyncText, syncedCount, emptyText,
-      showMore, toggleMore, closeMore, openRemark, saveRemark, removeRemark, remarkInput,
+      showMore, moreMenuStyle, toggleMore, closeMore, openRemark, saveRemark, removeRemark, remarkInput,
       unfollowed, remarks, markUnfollowed, restoreFollowed, clearUnfollowed, copyHandle, statusText,
       userWorksModal, worksSearch, worksPage, worksPageSize, worksTask, worksTaskStatus,
       worksList, worksTotalPages, worksPagedList, openUserWorks, closeUserWorks, downloadWork,
@@ -1552,16 +1674,17 @@ const PageFollowing = {
       <div class="dropdown">
         <button class="dropdown-toggle" @click="sortOpen = !sortOpen">{{ sortLabel }}</button>
         <div v-if="sortOpen" class="dropdown-menu">
-          <div
-            v-for="opt in sortOptions"
-            :key="opt.key"
-            class="dropdown-item"
-            :class="{active: sortBy===opt.key}"
-            @click="toggleSort(opt.key)"
-          >
-            {{ opt.label }}
-            <span class="order">{{ sortBy===opt.key ? (sortOrder==='desc'?'↓':'↑') : (opt.key==='name'?'↑':'↓') }}</span>
-          </div>
+          <template v-for="opt in sortOptions" :key="opt.key">
+            <div v-if="opt.divider" class="dropdown-divider"></div>
+            <div
+              class="dropdown-item"
+              :class="{active: sortBy===opt.key}"
+              @click="toggleSort(opt.key)"
+            >
+              {{ opt.label }}
+              <span class="order">{{ arrowFor(opt.key, sortBy===opt.key ? sortOrder : defaultOrderFor(opt.key)) }}</span>
+            </div>
+          </template>
         </div>
       </div>
       <div class="view-toggle">
@@ -1587,6 +1710,7 @@ const PageFollowing = {
           <div>用户</div>
           <div class="num-col">作品数</div>
           <div class="num-col">粉丝数</div>
+          <div class="time-col" title="抖音未提供精确关注时间，此处按同步时获取的顺序排列">关注顺序</div>
           <div class="status-col">状态</div>
           <div class="action-col"></div>
         </div>
@@ -1599,12 +1723,15 @@ const PageFollowing = {
           </div>
           <div class="col num-col">{{ formatNumber(u.works) }}</div>
           <div class="col num-col">{{ formatNumber(u.fans) }}</div>
+          <div class="col time-col" :title="u.followOrder != null ? ('第 ' + (u.followOrder + 1) + ' 位') : '未获取到顺序'">
+            {{ u.followOrder != null ? '第 ' + (u.followOrder + 1) + ' 位' : '-' }}
+          </div>
           <div class="col status-col" :class="u.downloadStatus">{{ statusText(u) }}</div>
           <div class="action-col">
             <button class="btn btn-primary" @click="downloadUser(u)"><span v-html="$icons.download"></span> 下载</button>
             <div class="more-wrap">
               <button class="btn btn-icon more" @click="toggleMore(u.sec_uid, $event)" v-html="$icons.more"></button>
-              <div class="more-menu" v-if="showMore===u.sec_uid" @click.stop>
+              <div class="more-menu" v-if="showMore===u.sec_uid" :style="moreMenuStyle" @click.stop>
                 <div class="more-item" @click="openUserWorks(u); closeMore()">查看作品</div>
                 <div class="more-item" @click="downloadUser(u); closeMore()">下载主页</div>
                 <div class="more-item" @click="openRemark(u); closeMore()">{{ u.remark ? '编辑备注' : '添加备注' }}</div>
@@ -1629,7 +1756,7 @@ const PageFollowing = {
           <div class="card-actions">
             <button class="btn btn-primary" @click="downloadUser(u)"><span v-html="$icons.download"></span> 下载</button>
             <button class="btn btn-icon more" @click="toggleMore(u.sec_uid, $event)" v-html="$icons.more"></button>
-            <div class="more-menu" v-if="showMore===u.sec_uid" @click.stop>
+            <div class="more-menu" v-if="showMore===u.sec_uid" :style="moreMenuStyle" @click.stop>
               <div class="more-item" @click="openUserWorks(u); closeMore()">查看作品</div>
               <div class="more-item" @click="downloadUser(u); closeMore()">下载主页</div>
               <div class="more-item" @click="openRemark(u); closeMore()">{{ u.remark ? '编辑备注' : '添加备注' }}</div>
@@ -1687,7 +1814,9 @@ const PageFollowing = {
         </div>
         <div class="toolbar" style="padding-top:0">
           <div class="search-box"><span class="icon" v-html="$icons.search"></span><input v-model="worksSearch" placeholder="搜索作品标题" /></div>
-          <button class="btn" :disabled="worksTaskStatus==='running'" @click="s.startUserWorks(userWorksModal.secUid, userWorksModal.nickname)">刷新</button>
+          <button class="btn" @click="worksTaskStatus==='running' ? s.cancelUserWorks(worksTask.id) : s.startUserWorks(userWorksModal.secUid, userWorksModal.nickname)">
+            {{ worksTaskStatus==='running' ? '取消' : '刷新' }}
+          </button>
         </div>
         <div class="user-works-body">
           <div v-if="worksTaskStatus==='running' && worksPagedList.length===0" class="empty-state"><div class="big-icon" v-html="$icons.refresh"></div><div>正在加载作品...</div></div>
@@ -2859,6 +2988,8 @@ const app = createApp({
     ];
 
     store.loadSettings();
+    store.recoverStalledSyncs();
+    setInterval(store.recoverStalledSyncs, 30_000);
 
     if (window.electronAPI) {
       window.electronAPI.onDownloadProgress(store.onProgress);

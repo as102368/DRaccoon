@@ -73,6 +73,16 @@ def _format_aweme(item: dict) -> dict:
     }
 
 
+def _write_debug_log(message: str) -> None:
+    try:
+        from pathlib import Path
+        log_path = Path(__file__).resolve().parent / "user_works_debug.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
+
+
 async def _fetch_user_works(
     sec_uid: str,
     cookies: Dict[str, str],
@@ -80,6 +90,7 @@ async def _fetch_user_works(
     proxy: str,
     out: BridgeOutput,
 ) -> List[dict]:
+    _write_debug_log(f"start sec_uid={sec_uid} limit={limit} proxy={proxy} cookies_keys={list(cookies.keys())}")
     cookie_manager = CookieManager(cookie_file=".cookies.json")
     cookie_manager.set_cookies(cookies)
     rate_limiter = RateLimiter(max_per_second=1.5)
@@ -88,6 +99,7 @@ async def _fetch_user_works(
     cursor = 0
     page = 0
     has_more = True
+    empty_retries = 0
 
     async with DouyinAPIClient(cookie_manager.get_cookies(), proxy=proxy or None) as api:
         while has_more and (limit <= 0 or len(results) < limit):
@@ -98,6 +110,7 @@ async def _fetch_user_works(
             resp = await api.get_user_post(sec_uid, max_cursor=cursor, count=18)
             status_code = resp.get("status_code", 0)
             status_msg = resp.get("status_msg", "")
+            _write_debug_log(f"page={page} cursor={cursor} status_code={status_code} msg={status_msg} has_more={resp.get('has_more')} items={len(resp.get('items') or resp.get('aweme_list') or [])}")
 
             if status_code != 0:
                 out.emit("log", {"level": "warning", "message": f"接口返回 status_code={status_code}, msg={status_msg}"})
@@ -107,6 +120,13 @@ async def _fetch_user_works(
                 formatted = [_format_aweme(it) for it in items]
                 results.extend(formatted)
                 out.emit("items", {"items": formatted, "total": len(results)})
+                empty_retries = 0
+            elif page == 1 and empty_retries < 2:
+                empty_retries += 1
+                out.emit("log", {"level": "warning", "message": f"首页为空，第 {empty_retries} 次重试..."})
+                _write_debug_log(f"first page empty, retry {empty_retries}")
+                await asyncio.sleep(0.8 + empty_retries * 0.7)
+                continue
 
             has_more = bool(resp.get("has_more", False))
             cursor = resp.get("max_cursor", 0)
@@ -117,6 +137,7 @@ async def _fetch_user_works(
             # 防止过快触发风控
             await asyncio.sleep(0.8 if page <= 3 else 1.5)
 
+    _write_debug_log(f"done total={len(results)}")
     if limit > 0 and len(results) > limit:
         results = results[:limit]
     return results

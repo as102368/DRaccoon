@@ -520,6 +520,12 @@ body {
   color: var(--accent);
 }
 
+.dropdown-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
 .view-toggle {
   display: flex;
   border: 1px solid var(--border);
@@ -1923,13 +1929,13 @@ body {
 
 .following-list .list-header,
 .following-list .list-row {
-  grid-template-columns: 52px 2fr 1fr 1fr 120px 150px;
+  grid-template-columns: 52px 2fr 1fr 1fr 110px 120px 150px;
   gap: 12px;
 }
 
 .following-list.multi-select .list-header,
 .following-list.multi-select .list-row {
-  grid-template-columns: 44px 52px 2fr 1fr 1fr 120px 150px;
+  grid-template-columns: 44px 52px 2fr 1fr 1fr 110px 120px 150px;
 }
 
 .following-list .list-row.unfollowed {
@@ -1948,7 +1954,8 @@ body {
   accent-color: var(--accent);
 }
 
-.following-list .num-col {
+.following-list .num-col,
+.following-list .time-col {
   text-align: right;
 }
 
@@ -1976,15 +1983,13 @@ body {
 }
 
 .more-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  position: fixed;
   min-width: 150px;
   background: var(--card-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
-  z-index: 50;
+  z-index: 1000;
   padding: 6px 0;
 }
 
@@ -2105,11 +2110,6 @@ body {
   display: flex;
   gap: 8px;
   position: relative;
-}
-
-.following-card .more-menu {
-  top: calc(100% + 6px);
-  right: 0;
 }
 
 .btn-danger {

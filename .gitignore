@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Electron runtime binaries
+electron/
+
 # Build outputs
 dist/
 build/
@@ -13,6 +16,8 @@ out/
 .env
 .env.*
 *.local
+.cookies.json
+python/.cookies.json
 
 # Logs
 *.log
@@ -29,6 +34,10 @@ userData/
 test_download_output/
 test_sync_output/
 test_*_output.txt
+python/test_output/
+python/test_video.mp4
+*.db-shm
+*.db-wal
 
 # Screenshots and temporary images
 test_*.png

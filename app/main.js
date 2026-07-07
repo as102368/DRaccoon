@@ -797,6 +797,9 @@ ipcMain.handle('download:cancel', (_event, taskId) => {
 });
 
 // ========== IPC：同步 ==========
+const SYNC_MAX_RUNTIME_MS = 10 * 60 * 1000; // 同步最大运行 10 分钟
+const SYNC_STALL_MS = 3 * 60 * 1000;        // 3 分钟无输出视为卡住
+
 ipcMain.handle('sync:start', async (_event, payload) => {
   const { syncId, kind, config, cookies, limits } = payload;
 
@@ -815,9 +818,43 @@ ipcMain.handle('sync:start', async (_event, payload) => {
   });
   trackProcess(proc);
 
-  activeSyncs.set(syncId, { proc, startTime: Date.now() });
+  const syncState = { proc, startTime: Date.now(), lastActivity: Date.now(), finished: false };
+  activeSyncs.set(syncId, syncState);
+
+  const finishOnce = (code) => {
+    if (syncState.finished) return;
+    syncState.finished = true;
+    activeSyncs.delete(syncId);
+    clearTimeout(maxRuntimeTimer);
+    clearTimeout(stallTimer);
+    try { fs.unlinkSync(jobFile); } catch (e) {}
+    sendToRenderer('sync:finished', { syncId, code, kind });
+  };
+
+  const maxRuntimeTimer = setTimeout(() => {
+    console.warn(`[sync] ${syncId} 运行超过 ${SYNC_MAX_RUNTIME_MS}ms，强制终止`);
+    if (proc && !proc.killed) {
+      killProcessTree(proc.pid);
+    }
+    // 如果 close 事件未触发，主动 finish
+    setTimeout(() => finishOnce(124), 500);
+  }, SYNC_MAX_RUNTIME_MS);
+
+  const resetStallTimer = () => {
+    clearTimeout(stallTimer);
+    return setTimeout(() => {
+      console.warn(`[sync] ${syncId} 超过 ${SYNC_STALL_MS}ms 无输出，视为卡住`);
+      if (proc && !proc.killed) {
+        killProcessTree(proc.pid);
+      }
+      setTimeout(() => finishOnce(125), 500);
+    }, SYNC_STALL_MS);
+  };
+  let stallTimer = resetStallTimer();
 
   proc.stdout.on('data', (data) => {
+    syncState.lastActivity = Date.now();
+    stallTimer = resetStallTimer();
     const lines = data.toString('utf-8').split(/\r?\n/);
     for (const line of lines) {
       if (!line.trim()) continue;
@@ -831,6 +868,8 @@ ipcMain.handle('sync:start', async (_event, payload) => {
   });
 
   proc.stderr.on('data', (data) => {
+    syncState.lastActivity = Date.now();
+    stallTimer = resetStallTimer();
     const lines = data.toString('utf-8').split(/\r?\n/);
     for (const line of lines) {
       if (line.trim()) {
@@ -839,10 +878,13 @@ ipcMain.handle('sync:start', async (_event, payload) => {
     }
   });
 
+  proc.on('error', (err) => {
+    console.error(`[sync] ${syncId} process error`, err);
+    finishOnce(126);
+  });
+
   proc.on('close', (code) => {
-    activeSyncs.delete(syncId);
-    try { fs.unlinkSync(jobFile); } catch (e) {}
-    sendToRenderer('sync:finished', { syncId, code, kind });
+    finishOnce(code);
   });
 
   return { started: true };
@@ -855,6 +897,7 @@ ipcMain.handle('sync:cancel', (_event, syncId) => {
 // ========== IPC：博主作品列表 ==========
 ipcMain.handle('userWorks:start', async (_event, payload) => {
   const { taskId, secUid, nickname, cookies, limit, proxy } = payload;
+  console.log(`[userWorks:start] taskId=${taskId} secUid=${secUid ? secUid.slice(0, 30) : 'none'} limit=${limit}`);
   if (!secUid) {
     return { started: false, error: '缺少 secUid' };
   }
