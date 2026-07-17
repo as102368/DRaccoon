@@ -2,7 +2,6 @@
 ## 目录结构
 
 ```text
-D:\DOU\douzy-electron
 ├── app/                     # 应用源码
 │   ├── main.js              # Electron 主进程
 │   ├── preload.js           # 预加载脚本（窗口控制 IPC）
@@ -21,7 +20,7 @@ D:\DOU\douzy-electron
 
 ## 运行方式
 
-直接双击 `start.bat`
+直接双击 `DRaccoon.exe`
 
 ## 已实现页面
 
