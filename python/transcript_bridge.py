@@ -157,7 +157,7 @@ async def _transcribe_api(
                 return payload
 
 
-def _transcribe_local(audio_path: Path, model_name: str, language: str, out: BridgeOutput) -> dict[str, Any]:
+async def _transcribe_local(audio_path: Path, model_name: str, language: str, out: BridgeOutput) -> dict[str, Any]:
     try:
         import whisper
     except ImportError as exc:
@@ -169,9 +169,11 @@ def _transcribe_local(audio_path: Path, model_name: str, language: str, out: Bri
         model_name = "base"
 
     out.log(f"正在加载 Whisper 模型：{model_name}（首次加载可能较慢）…")
-    model = whisper.load_model(model_name)
+    model = await asyncio.to_thread(whisper.load_model, model_name)
     out.log("模型加载完成，开始识别…")
-    result = model.transcribe(str(audio_path), language=language or None, verbose=False)
+    result = await asyncio.to_thread(
+        model.transcribe, str(audio_path), language=language or None, verbose=False
+    )
     return result
 
 
@@ -242,7 +244,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
                 raise ValueError("API 模式需要填写 apiKey")
             payload = await _transcribe_api(tmp_audio, api_key, model, language, out)
         elif mode == "local":
-            payload = _transcribe_local(tmp_audio, model, language, out)
+            payload = await _transcribe_local(tmp_audio, model, language, out)
         else:
             raise ValueError(f"不支持的转录模式：{mode}")
 

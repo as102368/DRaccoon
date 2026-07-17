@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from .redactor import SensitiveRedactor
 
@@ -29,15 +30,20 @@ class BridgeOutput:
         self._finished = False
 
     def emit(self, event: str, data: dict[str, Any] | None = None):
-        """输出一条 JSON Lines 事件。"""
+        """输出一条 JSON Lines 事件。
+
+        使用 redact_dict 对 payload 做键级脱敏，避免 redact_text 的正则
+        匹配到 URL 中的 key=value 片段（如 x-signature=xxx）从而破坏 JSON
+        引号和逗号，导致前端 JSON.parse 失败、事件丢失。
+        """
         payload = {"event": event}
         if self.context:
             payload["task_id"] = self.context.task_id
             payload["task_type"] = self.context.task_type
         if data:
             payload.update(data)
+        payload = SensitiveRedactor.redact_dict(payload)
         line = json.dumps(payload, ensure_ascii=False)
-        line = SensitiveRedactor.redact_text(line)
         print(line, flush=True)
 
     def log(self, message: str, level: str = "info"):
@@ -69,6 +75,49 @@ def read_job_file(path: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def _is_log_path_allowed(log_path: str) -> bool:
+    """检查日志路径是否位于允许的日志目录内，防止 taskId 路径穿越。"""
+    user_data = os.environ.get("DOUZY_USER_DATA")
+    if not user_data:
+        return True  # 无环境变量时不做限制，保持向后兼容
+    try:
+        resolved = Path(log_path).resolve()
+        allowed_root = Path(user_data).resolve() / "logs" / "bridges"
+        resolved.relative_to(allowed_root)
+        return True
+    except Exception:
+        return False
+
+
+def _redirect_to_files(stdout_log: Optional[str], stderr_log: Optional[str]) -> None:
+    """将 stdout/stderr 重定向到日志文件，避免 Electron GUI 进程的 stdio 事件不可靠。"""
+    if stdout_log:
+        try:
+            if not _is_log_path_allowed(stdout_log):
+                sys.stderr.write(f"拒绝写入非法日志路径: {stdout_log}\n")
+                return
+            Path(stdout_log).parent.mkdir(parents=True, exist_ok=True)
+            sys.stdout = open(stdout_log, "w", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+    if stderr_log:
+        try:
+            if not _is_log_path_allowed(stderr_log):
+                return
+            Path(stderr_log).parent.mkdir(parents=True, exist_ok=True)
+            sys.stderr = open(stderr_log, "w", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+
+
+def _flush_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+
+
 def safe_main(main_func: Callable[[BridgeContext, dict[str, Any], BridgeOutput], Any]):
     """桥接脚本入口装饰器。
 
@@ -84,13 +133,19 @@ def safe_main(main_func: Callable[[BridgeContext, dict[str, Any], BridgeOutput],
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", required=True, help="任务 JSON 文件路径")
     parser.add_argument("--task-id", default=None, help="任务 ID")
+    parser.add_argument("--stdout-log", default=None, help="stdout 重定向目标日志文件")
+    parser.add_argument("--stderr-log", default=None, help="stderr 重定向目标日志文件")
     args = parser.parse_args()
+
+    # 尽早重定向，确保后续所有 JSON Lines 事件都写入 Electron 可轮询的日志文件。
+    _redirect_to_files(args.stdout_log, args.stderr_log)
 
     try:
         job = read_job_file(args.job)
     except Exception as e:
         out = BridgeOutput()
         out.error(f"读取任务文件失败: {e}")
+        _flush_streams()
         sys.exit(1)
 
     task_id = args.task_id or job.get("task_id") or "unknown"
@@ -104,3 +159,5 @@ def safe_main(main_func: Callable[[BridgeContext, dict[str, Any], BridgeOutput],
     except Exception as e:
         out.error(str(e))
         sys.exit(1)
+    finally:
+        _flush_streams()

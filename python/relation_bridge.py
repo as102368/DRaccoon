@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from lib.bridge import BridgeContext, BridgeOutput, safe_main
@@ -13,6 +14,7 @@ from lib.compat import ensure_backend_path
 
 ensure_backend_path()
 
+from auth import CookieManager  # noqa: E402
 from core.api_client import DouyinAPIClient, LoginRequiredError  # noqa: E402
 from core.relation_service import RelationService  # noqa: E402
 from utils.cookie_utils import parse_cookie_header  # noqa: E402
@@ -33,6 +35,11 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
     if not cookies:
         raise ValueError("Cookie 为空")
 
+    cookie_file = str(job.get("cookieFile") or "").strip()
+    if cookie_file:
+        Path(cookie_file).parent.mkdir(parents=True, exist_ok=True)
+        CookieManager(cookie_file=cookie_file).set_cookies(cookies)
+
     anti_csrf = cookies.get("passport_csrf_token") or cookies.get("passport_csrf_token_default", "")
     if not anti_csrf:
         out.log("警告：Cookie 中未找到 passport_csrf_token，关注/取关接口可能会失败", level="warning")
@@ -40,13 +47,10 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
     proxy = str(job.get("proxy") or "").strip() or None
     min_delay = float(config.get("minDelay", 2.0))
     max_delay = float(config.get("maxDelay", 4.0))
-    dry_run = bool(config.get("dryRun", False))
 
     out.log(f"开始批量{ '关注' if action == 'follow' else '取关' }，共 {len(sec_uids)} 个用户")
-    if dry_run:
-        out.log("已启用 dryRun，不会真正调用接口")
 
-    async with DouyinAPIClient(cookies, proxy=proxy) as api:
+    async with DouyinAPIClient(cookies, proxy=proxy, config=config) as api:
         service = RelationService(api, min_delay=min_delay, max_delay=max_delay)
         total = len(sec_uids)
         success_count = 0
@@ -54,7 +58,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
         skipped_count = 0
         results: list[dict[str, Any]] = []
 
-        async for result in service.iter_batch(sec_uids, action, dry_run=dry_run):
+        async for result in service.iter_batch(sec_uids, action, dry_run=False):
             result_dict = result.to_dict()
             results.append(result_dict)
             success_count += 1 if result.success else 0
@@ -65,6 +69,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
                 f"{result.sec_uid[:20]}... "
                 f"{'成功' if result.success else '失败'}"
             )
+            msg += f" [code={result.status_code}]"
             if result.status_msg:
                 msg += f" ({result.status_msg})"
             if result.error:

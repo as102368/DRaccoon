@@ -83,7 +83,11 @@ class SensitiveRedactor:
 
     @classmethod
     def redact_dict(cls, obj: dict | None, extra_keys: set[str] | None = None) -> dict:
-        """对字典中指定键的值进行脱敏，返回新字典。"""
+        """对字典中指定键的值进行脱敏，返回新字典。
+
+        只对 SENSITIVE_KEYS 匹配的键做 _mask_value；普通字符串值（如 URL、标题）
+        原样保留，避免 redact_text 的正则破坏 URL 中的 query 参数。
+        """
         if not obj:
             return obj or {}
         sensitive = cls.SENSITIVE_KEYS | (extra_keys or set())
@@ -95,9 +99,7 @@ class SensitiveRedactor:
             elif isinstance(v, dict):
                 result[k] = cls.redact_dict(v, extra_keys)
             elif isinstance(v, list):
-                result[k] = [cls.redact_dict(i, extra_keys) if isinstance(i, dict) else cls.redact_text(i) for i in v]
-            elif isinstance(v, str):
-                result[k] = cls.redact_text(v)
+                result[k] = [cls.redact_dict(i, extra_keys) if isinstance(i, dict) else i for i in v]
             else:
                 result[k] = v
         return result

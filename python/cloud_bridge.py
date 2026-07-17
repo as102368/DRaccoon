@@ -19,6 +19,56 @@ from lib.bridge import BridgeContext, BridgeOutput, safe_main
 
 BACKUP_KEY_PREFIX = "douzy-backup"
 
+# 允许恢复的根目录：用户数据目录与下载输出目录
+_ALLOWED_BACKUP_ROOTS: list[Path] = []
+
+
+def _set_allowed_roots(ctx: BridgeContext) -> None:
+    """根据任务上下文设置允许的路径根目录（通常在 safe_main 中调用一次）。"""
+    global _ALLOWED_BACKUP_ROOTS
+    roots = []
+    user_data = os.environ.get("DOUZY_USER_DATA")
+    if user_data:
+        roots.append(Path(user_data).resolve())
+    output_path = os.environ.get("DOUZY_OUTPUT_PATH")
+    if output_path:
+        roots.append(Path(output_path).resolve())
+    # 当前工作目录作为主进程传入的 Python 根目录也允许
+    roots.append(Path.cwd().resolve())
+    _ALLOWED_BACKUP_ROOTS = roots
+
+
+def _is_within_allowed_roots(target: Path) -> bool:
+    """检查目标路径是否位于允许根目录内，防止路径穿越。"""
+    if not target:
+        return False
+    try:
+        resolved = target.resolve()
+    except Exception:
+        return False
+    for root in _ALLOWED_BACKUP_ROOTS:
+        try:
+            rel = resolved.relative_to(root)
+            # relative_to 成功即表示在根目录下
+            return rel is not None
+        except ValueError:
+            continue
+    return False
+
+
+def _sanitize_filename(name: str) -> str:
+    """清理文件名，禁止路径分隔符和 ..，防止通过文件名穿越目录。"""
+    import re
+
+    if not name:
+        return "unnamed"
+    name = name.replace("\\", "_").replace("/", "_").replace("..", "_")
+    name = re.sub(r'[<>:"|?*#]', "_", name)
+    name = name.strip(". ")
+    if not name:
+        return "unnamed"
+    return name
+
 
 def _object_key(token: str) -> str:
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
@@ -143,6 +193,7 @@ def _download(provider: str, key: str, creds: dict[str, str], out: BridgeOutput)
 
 
 def _backup(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
+    _set_allowed_roots(ctx)
     provider = str(job.get("provider") or "").strip().lower()
     if provider not in {"s3", "oss"}:
         raise ValueError("provider 必须是 s3 或 oss")
@@ -166,6 +217,9 @@ def _backup(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
 
     manifest: list[dict[str, str]] = []
     for canonical_name, path in files_to_backup:
+        if not _is_within_allowed_roots(Path(path)):
+            out.log(f"跳过不在允许目录内的文件：{path}", level="warning")
+            continue
         result = _read_file_b64(path)
         if result is None:
             out.log(f"跳过不存在的文件：{path}", level="warning")
@@ -173,7 +227,7 @@ def _backup(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
         filename, content_b64 = result
         manifest.append({
             "name": canonical_name,
-            "filename": filename,
+            "filename": _sanitize_filename(filename),
             "content_b64": content_b64,
         })
 
@@ -193,6 +247,7 @@ def _backup(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
 
 
 def _restore(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
+    _set_allowed_roots(ctx)
     provider = str(job.get("provider") or "").strip().lower()
     if provider not in {"s3", "oss"}:
         raise ValueError("provider 必须是 s3 或 oss")
@@ -211,6 +266,11 @@ def _restore(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None
     db_path = str(job.get("dbPath") or "").strip()
     settings_path = str(job.get("settingsPath") or "").strip()
 
+    # 恢复目标必须位于允许的根目录内
+    output_dir_path = Path(output_dir).resolve() if output_dir else None
+    if output_dir_path and not _is_within_allowed_roots(output_dir_path):
+        raise ValueError("恢复目录不在允许的范围内")
+
     key = _object_key(token)
     encrypted = _download(provider, key, creds, out)
 
@@ -222,27 +282,39 @@ def _restore(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None
     manifest = json.loads(decrypted.decode("utf-8"))
     restored: list[str] = []
 
+    cookie_file = str(job.get("cookieFile") or "").strip()
+
     for item in manifest:
         name = item.get("name")
         content = base64.b64decode(item.get("content_b64", ""))
+        filename = _sanitize_filename(item.get("filename", name or "unnamed"))
 
         if name == "settings.json":
             target = settings_path or (Path(output_dir) / "settings.json" if output_dir else "")
         elif name == "dy_downloader.db":
             target = db_path or (Path(output_dir) / "dy_downloader.db" if output_dir else "")
         elif name == "cookies.txt":
-            target = str(Path(output_dir) / item.get("filename", "cookies.txt")) if output_dir else ""
+            if cookie_file:
+                target = cookie_file
+            elif output_dir:
+                target = str(Path(output_dir) / filename)
+            else:
+                target = ""
         else:
-            target = str(Path(output_dir) / item.get("filename", name)) if output_dir else ""
+            target = str(Path(output_dir) / filename) if output_dir else ""
 
         if not target:
             out.log(f"无法确定 {name} 的恢复路径，跳过", level="warning")
             continue
 
-        target_path = Path(target)
+        target_path = Path(target).resolve()
+        if not _is_within_allowed_roots(target_path):
+            out.log(f"跳过不在允许目录内的恢复目标：{target}", level="warning")
+            continue
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(content)
-        restored.append(str(target_path.resolve()))
+        restored.append(str(target_path))
         out.log(f"已恢复：{target_path.name}")
 
     out.finished(success=True, data={"restored_files": restored})

@@ -1,11 +1,17 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // 工具
+  pathJoin: (...segments) => ipcRenderer.invoke('path:join', segments),
+  pathJoinSync: (...segments) => ipcRenderer.sendSync('path:join-sync', segments),
+  writeClipboard: (text) => ipcRenderer.invoke('clipboard:writeText', text),
+
   // 窗口控制
   minimize: () => ipcRenderer.invoke('window-minimize'),
   maximize: () => ipcRenderer.invoke('window-maximize'),
   close: () => ipcRenderer.invoke('window-close'),
   isMaximized: () => ipcRenderer.invoke('window-is-maximized'),
+  restartApp: () => ipcRenderer.invoke('app:restart'),
 
   // 设置
   getSettings: () => ipcRenderer.invoke('settings:get'),
@@ -17,6 +23,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // 档案
   listArchive: (dirPath) => ipcRenderer.invoke('archive:list', dirPath),
+  getArchiveStatus: (payload) => ipcRenderer.invoke('archive:status', payload),
   deleteArchive: (dirPath) => ipcRenderer.invoke('archive:delete', dirPath),
   openVideo: (filePath) => ipcRenderer.invoke('video:open', filePath),
 
@@ -29,6 +36,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cancelSync: (syncId) => ipcRenderer.invoke('sync:cancel', syncId),
   getSyncCache: (kind) => ipcRenderer.invoke('sync:get', kind),
   clearSyncCache: (kind) => ipcRenderer.invoke('sync:clear', kind),
+  saveSyncCache: (kind, data) => ipcRenderer.invoke('sync:save', kind, data),
 
   // 博主作品列表
   startUserWorks: (payload) => ipcRenderer.invoke('userWorks:start', payload),
@@ -50,80 +58,56 @@ contextBridge.exposeInMainWorld('electronAPI', {
   exportReport: (payload) => ipcRenderer.invoke('report:export', payload),
   cancelReport: (taskId) => ipcRenderer.invoke('report:cancel', taskId),
 
-  // 字幕生成
-  startTranscript: (payload) => ipcRenderer.invoke('transcript:start', payload),
-  cancelTranscript: (taskId) => ipcRenderer.invoke('transcript:cancel', taskId),
-
   // 云同步
   backupCloud: (payload) => ipcRenderer.invoke('cloud:backup', payload),
   restoreCloud: (payload) => ipcRenderer.invoke('cloud:restore', payload),
   cancelCloud: (taskId) => ipcRenderer.invoke('cloud:cancel', taskId),
 
   // 全局快捷键
-  onShortcutTriggered: (callback) =>
-    ipcRenderer.on('shortcut:triggered', (_event, payload) => callback(payload)),
+  onShortcutTriggered: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('shortcut:triggered', listener);
+    return () => ipcRenderer.removeListener('shortcut:triggered', listener);
+  },
 
   // 事件监听：下载
-  onDownloadProgress: (callback) =>
-    ipcRenderer.on('download:progress', (_event, payload) => callback(payload)),
-  onDownloadLog: (callback) =>
-    ipcRenderer.on('download:log', (_event, payload) => callback(payload)),
-  onDownloadFinished: (callback) =>
-    ipcRenderer.on('download:finished', (_event, payload) => callback(payload)),
+  onDownloadProgress: (callback) => makeListener('download:progress', callback),
+  onDownloadLog: (callback) => makeListener('download:log', callback),
+  onDownloadFinished: (callback) => makeListener('download:finished', callback),
 
   // 事件监听：同步
-  onSyncProgress: (callback) =>
-    ipcRenderer.on('sync:progress', (_event, payload) => callback(payload)),
-  onSyncLog: (callback) =>
-    ipcRenderer.on('sync:log', (_event, payload) => callback(payload)),
-  onSyncFinished: (callback) =>
-    ipcRenderer.on('sync:finished', (_event, payload) => callback(payload)),
+  onSyncProgress: (callback) => makeListener('sync:progress', callback),
+  onSyncLog: (callback) => makeListener('sync:log', callback),
+  onSyncFinished: (callback) => makeListener('sync:finished', callback),
 
   // 事件监听：批量关注/取关
-  onRelationProgress: (callback) =>
-    ipcRenderer.on('relation:progress', (_event, payload) => callback(payload)),
-  onRelationLog: (callback) =>
-    ipcRenderer.on('relation:log', (_event, payload) => callback(payload)),
-  onRelationFinished: (callback) =>
-    ipcRenderer.on('relation:finished', (_event, payload) => callback(payload)),
+  onRelationProgress: (callback) => makeListener('relation:progress', callback),
+  onRelationLog: (callback) => makeListener('relation:log', callback),
+  onRelationFinished: (callback) => makeListener('relation:finished', callback),
 
   // 事件监听：报表导出
-  onReportProgress: (callback) =>
-    ipcRenderer.on('report:progress', (_event, payload) => callback(payload)),
-  onReportLog: (callback) =>
-    ipcRenderer.on('report:log', (_event, payload) => callback(payload)),
-  onReportFinished: (callback) =>
-    ipcRenderer.on('report:finished', (_event, payload) => callback(payload)),
-
-  // 事件监听：字幕生成
-  onTranscriptProgress: (callback) =>
-    ipcRenderer.on('transcript:progress', (_event, payload) => callback(payload)),
-  onTranscriptLog: (callback) =>
-    ipcRenderer.on('transcript:log', (_event, payload) => callback(payload)),
-  onTranscriptFinished: (callback) =>
-    ipcRenderer.on('transcript:finished', (_event, payload) => callback(payload)),
+  onReportProgress: (callback) => makeListener('report:progress', callback),
+  onReportLog: (callback) => makeListener('report:log', callback),
+  onReportFinished: (callback) => makeListener('report:finished', callback),
 
   // 事件监听：云同步
-  onCloudProgress: (callback) =>
-    ipcRenderer.on('cloud:progress', (_event, payload) => callback(payload)),
-  onCloudLog: (callback) =>
-    ipcRenderer.on('cloud:log', (_event, payload) => callback(payload)),
-  onCloudFinished: (callback) =>
-    ipcRenderer.on('cloud:finished', (_event, payload) => callback(payload)),
+  onCloudProgress: (callback) => makeListener('cloud:progress', callback),
+  onCloudLog: (callback) => makeListener('cloud:log', callback),
+  onCloudFinished: (callback) => makeListener('cloud:finished', callback),
 
   // 事件监听：博主作品列表
-  onUserWorksProgress: (callback) =>
-    ipcRenderer.on('userWorks:progress', (_event, payload) => callback(payload)),
-  onUserWorksLog: (callback) =>
-    ipcRenderer.on('userWorks:log', (_event, payload) => callback(payload)),
-  onUserWorksFinished: (callback) =>
-    ipcRenderer.on('userWorks:finished', (_event, payload) => callback(payload)),
+  onUserWorksProgress: (callback) => makeListener('userWorks:progress', callback),
+  onUserWorksLog: (callback) => makeListener('userWorks:log', callback),
+  onUserWorksFinished: (callback) => makeListener('userWorks:finished', callback),
 
   // 事件监听：新发布
-  onNewReleasesProgress: (callback) =>
-    ipcRenderer.on('newReleases:progress', (_event, payload) => callback(payload)),
-  onNewReleasesLog: (callback) =>
-    ipcRenderer.on('newReleases:log', (_event, payload) => callback(payload)),
-  onNewReleasesFinished: (callback) =>
-    ipcRenderer.on('newReleases:finished', (_event, payload) => callback(payload)),
+  onNewReleasesProgress: (callback) => makeListener('newReleases:progress', callback),
+  onNewReleasesLog: (callback) => makeListener('newReleases:log', callback),
+  onNewReleasesFinished: (callback) => makeListener('newReleases:finished', callback),
 });
+
+function makeListener(channel, callback) {
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}

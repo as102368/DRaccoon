@@ -1,1 +1,0 @@
-{"task_type":"cloud_backup","provider":"s3","configPath":"d:/DOU/douzy-electron/python/test_report_job.json","dbPath":"d:/DOU/douzy-electron/python/test_report.db","cookiePath":"","credentials":{"accessKeyId":"","accessKeySecret":"","bucket":"test-bucket","region":"us-east-1","endpoint":""}}
