@@ -397,6 +397,12 @@ body {
   font-weight: 600;
 }
 
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .sync-bar {
   display: flex;
   align-items: center;
@@ -499,17 +505,6 @@ body {
   font-size: 12px;
   color: var(--text-secondary);
   white-space: nowrap;
-}
-
-.topic-limit-input {
-  width: 64px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--card-bg);
-  color: var(--text);
-  font-size: 13px;
-  outline: none;
 }
 
 .topic-sort-select {

@@ -752,8 +752,11 @@ store.startSync = async (kind, subKind, query, options = {}) => {
 
 store.cancelSync = (id) => {
   const sync = store.syncs.find(s => s.id === id);
-  if (sync && sync.status === 'running') {
-    sync.status = 'cancelling';
+  if (!sync || sync.status !== 'running') return;
+  sync.status = 'cancelling';
+  if (sync.kind === 'newReleases') {
+    store.cancelNewReleases();
+  } else {
     window.electronAPI.cancelSync(id);
   }
 };
@@ -851,6 +854,10 @@ store.recoverStalledSyncs = () => {
     if (now - last > STALL_TIMEOUT_MS) {
       sync.status = 'error';
       sync.step = '同步卡住，请重新尝试';
+      if (sync.kind === 'newReleases' && store.newReleases.taskId === sync.id) {
+        store.newReleases.status = 'error';
+        store.newReleases.error = sync.step;
+      }
       changed = true;
     }
   }
@@ -1018,13 +1025,29 @@ store.onUserWorksFinished = (payload) => {
 store.startNewReleases = async (filterOnly = false) => {
   if (!store.user.isLoggedIn) return;
   if (store.newReleases.status === 'running' || store.newReleases.status === 'cancelling') return;
-  const id = 'newReleases-' + Date.now();
+  const id = 'sync-newReleases-' + Date.now();
+  const now = Date.now();
   store.newReleases.status = 'running';
   store.newReleases.taskId = id;
   store.newReleases.items = [];
   store.newReleases.progress = {};
   store.newReleases.logs = [];
   store.newReleases.error = '';
+  const sync = reactive({
+    id,
+    kind: 'newReleases',
+    status: 'running',
+    step: '初始化',
+    progress: 0,
+    total: 0,
+    added: 0,
+    logs: [],
+    createdAt: new Date(now).toLocaleString(),
+    createdAtMs: now,
+    lastProgressAt: now,
+  });
+  store.syncs.unshift(sync);
+  store.saveTaskHistory();
   try {
     const result = await window.electronAPI.startNewReleases({
       taskId: id,
@@ -1037,10 +1060,16 @@ store.startNewReleases = async (filterOnly = false) => {
     if (!result || result.started === false) {
       store.newReleases.status = 'error';
       store.newReleases.error = `启动失败：${result && result.error ? result.error : '未知错误'}`;
+      sync.status = 'error';
+      sync.step = store.newReleases.error;
+      store.saveTaskHistory();
     }
   } catch (err) {
     store.newReleases.status = 'error';
     store.newReleases.error = `启动失败：${err && err.message ? err.message : err}`;
+    sync.status = 'error';
+    sync.step = store.newReleases.error;
+    store.saveTaskHistory();
   }
 };
 
@@ -1048,6 +1077,11 @@ store.cancelNewReleases = () => {
   const id = store.newReleases.taskId;
   if (id && store.newReleases.status === 'running') {
     store.newReleases.status = 'cancelling';
+    const sync = store.syncs.find(s => s.id === id);
+    if (sync) {
+      sync.status = 'cancelling';
+      sync.step = '取消中';
+    }
     window.electronAPI.cancelNewReleases(id);
   }
 };
@@ -1057,21 +1091,39 @@ store.onNewReleasesProgress = (payload) => {
   if (!data) return;
   // 已结束的任务忽略后续进度事件，避免状态被迟到事件覆盖
   if (store.newReleases.status !== 'running' && store.newReleases.status !== 'cancelling') return;
+  const sync = store.syncs.find(s => s.id === store.newReleases.taskId);
   if (data.event === 'start') {
     store.newReleases.progress = {
       current: 0,
       total: data.authors_total || 0,
       message: `开始检查 ${data.authors_total || 0} 位博主`,
     };
+    if (sync) {
+      sync.total = data.authors_total || 0;
+      sync.step = store.newReleases.progress.message;
+      sync.lastProgressAt = Date.now();
+    }
   } else if (data.event === 'progress') {
     store.newReleases.progress = {
       current: data.current_author_index || store.newReleases.progress.current || 0,
       total: data.total_authors || store.newReleases.progress.total || 0,
       message: data.message || '',
     };
+    if (sync) {
+      sync.total = store.newReleases.progress.total;
+      const current = store.newReleases.progress.current;
+      sync.progress = sync.total > 0 ? Math.min(100, Math.round((current / sync.total) * 100)) : 0;
+      sync.step = store.newReleases.progress.message;
+      sync.lastProgressAt = Date.now();
+    }
   } else if (data.event === 'items') {
     store.newReleases.items.push(...(data.items || []));
     store.newReleases.progress.message = `已发现 ${store.newReleases.items.length} 个新作品`;
+    if (sync) {
+      sync.added = store.newReleases.items.length;
+      sync.step = store.newReleases.progress.message;
+      sync.lastProgressAt = Date.now();
+    }
   } else if (data.event === 'done') {
     // 取消中的任务不应被进度通道的 done 事件覆盖为已完成，
     // 最终状态由 finished 通道根据 code 统一判定为 cancelled。
@@ -1085,14 +1137,25 @@ store.onNewReleasesProgress = (payload) => {
     };
     if (data.items) store.newReleases.items = data.items;
     store.loadSyncCache('new_releases');
+    if (sync) {
+      sync.total = data.authors_checked || 0;
+      sync.added = data.total || 0;
+      sync.progress = 100;
+      sync.step = store.newReleases.progress.message;
+      sync.lastProgressAt = Date.now();
+    }
   } else if (data.event === 'log') {
     store.newReleases.logs.push(data.message || '');
+    if (sync) sync.logs.push(data.message || '');
   }
 };
 
 store.onNewReleasesLog = (payload) => {
   const { line } = payload;
-  if (line) store.newReleases.logs.push(line);
+  if (!line) return;
+  store.newReleases.logs.push(line);
+  const sync = store.syncs.find(s => s.id === store.newReleases.taskId);
+  if (sync) sync.logs.push(line);
 };
 
 store.onNewReleasesFinished = (payload) => {
@@ -1101,16 +1164,31 @@ store.onNewReleasesFinished = (payload) => {
   if (store.newReleases.status !== 'running' && store.newReleases.status !== 'cancelling') return;
   const hasResult = store.newReleases.items && store.newReleases.items.length > 0;
   const backendError = data && (data.success === false || (typeof data.error === 'string' && data.error));
+  const sync = store.syncs.find(s => s.id === store.newReleases.taskId);
   if (store.newReleases.status === 'cancelling') {
     store.newReleases.status = 'cancelled';
     store.newReleases.error = '';
+    if (sync) {
+      sync.status = 'cancelled';
+      sync.step = '已取消';
+    }
   } else if (code === 0 && hasResult && !backendError) {
     store.newReleases.status = 'done';
+    if (sync) {
+      sync.status = 'success';
+      sync.step = '检查完成';
+      sync.progress = 100;
+    }
   } else {
     store.newReleases.status = 'error';
     store.newReleases.error = backendError ? `检查失败：${data.error}` : (hasResult ? `检查失败（code=${code}）` : '未检查到新作品');
+    if (sync) {
+      sync.status = 'error';
+      sync.step = store.newReleases.error;
+    }
   }
   store.loadSyncCache('new_releases');
+  if (sync) store.saveTaskHistory();
 };
 
 // ========== 批量关注/取关任务 ==========
@@ -2299,7 +2377,6 @@ const PageFavorites = {
     const activeCollection = ref('all');
     const search = ref('');
     const topicQuery = ref('');
-    const topicLimit = ref(200);
     const topicSortStrategy = ref('default');
     const topicSortOptions = [
       { value: 'default', label: '抖音推荐' },
@@ -2647,7 +2724,7 @@ const PageFavorites = {
           s.showToast('请输入话题 ID 或抖音话题链接');
           return;
         }
-        const limit = Math.max(1, Math.min(2000, parseInt(topicLimit.value, 10) || 200));
+        const limit = Math.max(1, Math.min(2000, parseInt(s.settings.syncLimits.topics, 10) || 200));
         const options = { limit, sortStrategy: topicSortStrategy.value };
         s.startSync(currentTab.value.kind, subKind, query, options);
       } else {
@@ -2666,7 +2743,7 @@ const PageFavorites = {
       if (activeTab.value === 'favorites' && activeSubTab.value === 'topics') {
         const query = topicQuery.value.trim() || (topicsCache.value.topic?.query);
         if (query) {
-          const limit = Math.max(1, Math.min(2000, parseInt(topicLimit.value, 10) || 200));
+          const limit = Math.max(1, Math.min(2000, parseInt(s.settings.syncLimits.topics, 10) || 200));
           const options = { limit, sortStrategy: topicSortStrategy.value };
           s.startSync(currentTab.value.kind, subKind, query, options);
         }
@@ -2713,7 +2790,7 @@ const PageFavorites = {
     });
 
     return {
-      activeTab, activeSubTab, activeCollection, search, topicQuery, topicLimit, topicSortStrategy, topicSortOptions, showDrawer, loading, tabs, subTabs,
+      activeTab, activeSubTab, activeCollection, search, topicQuery, topicSortStrategy, topicSortOptions, showDrawer, loading, tabs, subTabs,
       collections, currentList, filteredList, paginatedList, s, favCache, topicsCache, needsLogin,
       downloadItem, downloadMix, downloadMusic, selectCollection, syncCurrent, refreshCache, loadCaches,
       isCurrentSyncing, isAnySyncing, lastSync, lastSyncTime,
@@ -2758,10 +2835,6 @@ const PageFavorites = {
           <div v-if="activeTab==='favorites' && activeSubTab==='topics'" class="search-box topic-input"><span class="icon" v-html="$icons.search"></span><input v-model="topicQuery" placeholder="输入话题 ID、话题链接或抖音短链接" @keyup.enter="syncCurrent" /></div>
           <div v-else class="search-box"><span class="icon" v-html="$icons.search"></span><input v-model="search" :placeholder="(activeTab==='favorites' && activeSubTab==='mixes') ? '搜索名称' : '搜索作品标题 / 作者'" /></div>
           <template v-if="activeTab==='favorites' && activeSubTab==='topics'">
-            <div class="topic-option">
-              <span class="topic-option-label">数量</span>
-              <input v-model.number="topicLimit" type="number" min="1" max="2000" class="topic-limit-input" @keyup.enter="syncCurrent" />
-            </div>
             <div class="topic-option">
               <span class="topic-option-label">排序</span>
               <select v-model="topicSortStrategy" class="topic-sort-select">
@@ -3174,13 +3247,15 @@ const PageNewReleases = {
     <div class="page-header">
       <div class="page-label">New</div>
       <h1>新发布</h1>
-      <button class="btn" :disabled="isActive || needsLogin" @click="startSync">
-        <span :class="{spin: isActive}" v-html="$icons.refresh"></span> {{ isActive ? '检查中' : '同步新发布' }}
-      </button>
-      <button class="btn" :disabled="isActive || loading || needsLogin" @click="refreshCache" title="从本地缓存重新加载">
-        <span :class="{spin: loading}" v-html="$icons.rotateCw"></span> {{ loading ? '加载中' : '刷新' }}
-      </button>
-      <button class="btn" v-if="isRunning" @click="s.cancelNewReleases()">取消</button>
+      <div class="page-header-actions">
+        <button class="btn" :disabled="isActive || needsLogin" @click="startSync">
+          <span :class="{spin: isActive}" v-html="$icons.refresh"></span> {{ isActive ? '检查中' : '同步新发布' }}
+        </button>
+        <button class="btn" :disabled="isActive || loading || needsLogin" @click="refreshCache" title="从本地缓存重新加载">
+          <span :class="{spin: loading}" v-html="$icons.rotateCw"></span> {{ loading ? '加载中' : '刷新' }}
+        </button>
+        <button class="btn" v-if="isRunning" @click="s.cancelNewReleases()">取消</button>
+      </div>
     </div>
     <PageLogin v-if="needsLogin" />
     <template v-else>
@@ -3497,7 +3572,7 @@ const PageTasks = {
           const subMap = { folders: '收藏夹', videos: '收藏视频', music: '收藏音乐', mixes: '收藏合集', topics: '话题' };
           return `${subMap[task.subKind] || '收藏'} 同步`;
         }
-        const map = { likes: '喜欢', following: '关注' };
+        const map = { likes: '喜欢', following: '关注', newReleases: '新发布' };
         return `${map[task.kind] || task.kind} 同步`;
       }
       if (task.id.startsWith('relation-')) return task.action === 'follow' ? '批量关注' : '批量取关';
@@ -3512,7 +3587,10 @@ const PageTasks = {
         const links = task.urls?.length || 0;
         return links > 1 ? `${links} 个链接` : '单个链接';
       }
-      if (task.id.startsWith('sync-')) return `目标 ${task.total || 0} · 已新增 ${task.added || 0}`;
+      if (task.id.startsWith('sync-')) {
+        if (task.kind === 'newReleases') return `已检查博主 ${task.total || 0} · 新作品 ${task.added || 0}`;
+        return `目标 ${task.total || 0} · 已新增 ${task.added || 0}`;
+      }
       if (task.id.startsWith('relation-')) return `${task.total || 0} 位用户`;
       if (task.id.startsWith('report-')) {
         const opts = task.options || {};
@@ -3711,10 +3789,14 @@ const PageTasks = {
       if (rawTask.id.startsWith('task-')) {
         s.startTask(rawTask.urls, rawTask.name, rawTask.downloadContext);
       } else if (rawTask.id.startsWith('sync-')) {
-        s.startSync(rawTask.kind, rawTask.subKind, rawTask.query, {
-          limit: rawTask.limit,
-          sortStrategy: rawTask.sortStrategy,
-        });
+        if (rawTask.kind === 'newReleases') {
+          s.startNewReleases();
+        } else {
+          s.startSync(rawTask.kind, rawTask.subKind, rawTask.query, {
+            limit: rawTask.limit,
+            sortStrategy: rawTask.sortStrategy,
+          });
+        }
       } else if (rawTask.id.startsWith('relation-')) {
         s.startRelationTask(rawTask.action, rawTask.secUids);
       } else if (rawTask.id.startsWith('report-') && rawTask.options) {
@@ -3735,10 +3817,21 @@ const PageTasks = {
           .map(r => r.url)
           .filter(Boolean);
         const urlsToRetry = failedUrls.length > 0 ? failedUrls : task.urls;
-        s.startTask(urlsToRetry, task.name, task.downloadContext);
+        if (urlsToRetry.length > 0) {
+          const name = task.name;
+          const ctx = task.downloadContext;
+          // 重试前先移除旧任务记录，避免新旧记录混淆
+          removeTask(task);
+          s.startTask(urlsToRetry, name, ctx);
+        }
       } else if (task.id.startsWith('relation-') && task.summary && Array.isArray(task.summary.results)) {
         const failed = task.summary.results.filter(r => !r.success).map(r => r.sec_uid).filter(Boolean);
-        if (failed.length) s.startRelationTask(task.action, failed);
+        if (failed.length) {
+          const action = task.action;
+          // 重试前先移除旧任务记录，避免新旧记录混淆
+          removeTask(task);
+          s.startRelationTask(action, failed);
+        }
       } else {
         rerunTask(task);
       }

@@ -29,13 +29,20 @@ const { spawn, exec, execSync } = require('child_process');
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 
+// 统一应用名称为 DRaccoon，避免在任务栏 / 任务管理器 / userData 目录中显示为 electron
+app.setName('DRaccoon');
+if (process.platform === 'win32') {
+  // 让 Windows 任务栏按 DRaccoon 分组并显示正确图标
+  app.setAppUserModelId('com.draccoon.app');
+}
+
 // 提升 Chromium 渲染响应，减少后台节流导致的卡顿
 app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 // 禁用一些可能导致卡顿或多余后台任务的 Chromium 功能
 app.commandLine.appendSwitch('disable-features', 'CalculateWindowOcclusion,AutoFreezeBackgroundTab,PaintHolding,Translate,InterestFeedContentSuggestions');
-// 若内置浏览器仍卡顿/黑屏，可取消下面这行的注释禁用 GPU 加速
-// app.commandLine.appendSwitch('disable-gpu');
+// 将 GPU 进程合并进主进程，减少一个常驻进程（从 4 个降到 3 个）
+app.commandLine.appendSwitch('in-process-gpu');
 
 const userDataPath = app.getPath('userData');
 app.setPath('logs', path.join(userDataPath, 'logs'));
@@ -1284,10 +1291,11 @@ function enqueueDownload(queue) {
   if (activeDownloadQueue) {
     globalDownloadQueue.push(queue);
     queue.waiting = true;
-    const ahead = Math.max(0, globalDownloadQueue.length - 1);
+    // 排队数按「任务项」计算：包含当前正在执行的任务 + 排在本任务前面的任务
+    const ahead = globalDownloadQueue.length;
     sendToRenderer('download:progress', {
       taskId: queue.rootTaskId,
-      data: { event: 'step', step: '排队中', detail: ahead > 0 ? `前面还有 ${ahead} 个下载任务` : '等待当前下载任务完成' },
+      data: { event: 'step', step: '排队中', detail: `前面还有 ${ahead} 个下载任务` },
     });
     sendToRenderer('download:log', {
       taskId: queue.rootTaskId,
@@ -1306,6 +1314,14 @@ function dequeueNextDownload() {
   next.waiting = false;
   activeDownloadQueue = next;
   next._execute();
+  // 当前执行任务开始后，刷新剩余排队任务的 ahead 计数
+  globalDownloadQueue.forEach((queue, index) => {
+    const ahead = 1 + index; // 当前执行任务 + 排在前面的任务
+    sendToRenderer('download:progress', {
+      taskId: queue.rootTaskId,
+      data: { event: 'step', step: '排队中', detail: `前面还有 ${ahead} 个下载任务` },
+    });
+  });
 }
 
 // ========== 下载队列：批量下载拆分为单链接串行执行，失败自动跳过 ==========
