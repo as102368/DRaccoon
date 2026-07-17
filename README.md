@@ -1,6 +1,5 @@
 # Douzy Electron 前端复刻
 
-基于 Electron + Vue 3（CDN 引入）复刻 Douzy 桌面界面。
 
 ## 目录结构
 
