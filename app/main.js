@@ -1010,7 +1010,7 @@ ipcMain.handle('sync:save', (_event, kind, data) => {
 
 // ========== 通用 Python 桥接 ==========
 function getBackendRoot() {
-  return path.join(__dirname, '..', '..', 'douyin-downloader');
+  return path.join(__dirname, '..', 'backend');
 }
 
 function getPythonRoot() {
