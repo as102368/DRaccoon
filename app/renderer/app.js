@@ -2465,11 +2465,12 @@ const PageFavorites = {
       return list;
     });
 
-    function sortByNewest(items, orderKey = null) {
+    function sortByNewest(items, orderKey = null, descending = false) {
       return [...items].sort((a, b) => {
-        // 如果存在交互顺序字段（点赞/收藏顺序），优先按它排序：数值越小表示交互越新。
+        // 如果存在交互顺序字段（点赞/收藏顺序），优先按它排序。
+        // 默认数值越小表示交互越新；传入 descending=true 时按数值越大越新。
         if (orderKey && a && b && typeof a[orderKey] === 'number' && typeof b[orderKey] === 'number') {
-          return a[orderKey] - b[orderKey];
+          return descending ? b[orderKey] - a[orderKey] : a[orderKey] - b[orderKey];
         }
         const ta = (a && a.create_time) || 0;
         const tb = (b && b.create_time) || 0;
@@ -2478,7 +2479,9 @@ const PageFavorites = {
     }
 
     const currentList = computed(() => {
-      if (activeTab.value === 'likes') return sortByNewest(likesCache.value.items || [], 'like_order');
+      // 我的喜欢：当前后端写入的 like_order 是从小到大对应从早到晚，
+      // 因此需要降序排列，让最新的点赞作品显示在最前面。
+      if (activeTab.value === 'likes') return sortByNewest(likesCache.value.items || [], 'like_order', true);
       if (activeTab.value !== 'favorites') return [];
       if (activeSubTab.value === 'folders') {
         // 我的收藏夹：左侧边栏选择收藏夹，右侧显示该收藏夹内的视频
