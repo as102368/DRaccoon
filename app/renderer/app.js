@@ -2479,8 +2479,7 @@ const PageFavorites = {
     }
 
     const currentList = computed(() => {
-      // 我的喜欢：后端返回/写入的顺序是从旧到新，直接反转让最新点赞排在最前面。
-      if (activeTab.value === 'likes') return [...(likesCache.value.items || [])].reverse();
+      if (activeTab.value === 'likes') return sortByNewest(likesCache.value.items || [], 'like_order');
       if (activeTab.value !== 'favorites') return [];
       if (activeSubTab.value === 'folders') {
         // 我的收藏夹：左侧边栏选择收藏夹，右侧显示该收藏夹内的视频
