@@ -5030,9 +5030,7 @@ const app = createApp({
       <div class="title-bar">
         <div class="brand">
           <div class="logo">
-            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M12 2L14.5 9H22L16 13.5L18.5 21L12 16.5L5.5 21L8 13.5L2 9H9.5L12 2Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="round"/>
-            </svg>
+            <img src="./icon.png" alt="DRaccoon" />
           </div>
           <span>DRaccoon</span>
         </div>

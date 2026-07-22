@@ -468,18 +468,13 @@ function redactObject(obj) {
 
 // ========== 窗口与托盘 ==========
 function getTrayIconPath() {
-  // 优先使用项目内图标，否则使用系统默认
   const iconPng = path.join(__dirname, 'renderer', 'icon.png');
-  const iconIco = path.join(__dirname, 'renderer', 'icon.ico');
-  if (process.platform === 'win32' && fs.existsSync(iconIco)) return iconIco;
   if (fs.existsSync(iconPng)) return iconPng;
   return null;
 }
 
 function getWindowIconPath() {
   const iconPng = path.join(__dirname, 'renderer', 'icon.png');
-  const iconIco = path.join(__dirname, 'renderer', 'icon.ico');
-  if (process.platform === 'win32' && fs.existsSync(iconIco)) return iconIco;
   if (fs.existsSync(iconPng)) return iconPng;
   return null;
 }

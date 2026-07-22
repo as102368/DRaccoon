@@ -99,6 +99,19 @@ with zipfile.ZipFile(zip_path, 'r') as z:
 print('重命名 electron.exe -> DRaccoon.exe ...')
 (build_dist / 'electron.exe').rename(build_dist / 'DRaccoon.exe')
 
+print('设置 exe 图标 ...')
+icon_ico = root / 'app' / 'renderer' / 'icon.ico'
+rcedit = root / 'rcedit-x64.exe'
+if icon_ico.exists() and rcedit.exists():
+    import subprocess
+    try:
+        subprocess.run([str(rcedit), str(build_dist / 'DRaccoon.exe'), '--set-icon', str(icon_ico)], check=True)
+        print(f'已设置 exe 图标: {icon_ico}')
+    except Exception as exc:
+        print(f'警告: 设置 exe 图标失败: {exc}')
+else:
+    print(f'警告: 未找到 rcedit 或 icon.ico，跳过 exe 图标设置')
+
 print('复制 app/ 到 resources/app/ ...')
 res_app = build_dist / 'resources' / 'app'
 if res_app.exists():
