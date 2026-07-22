@@ -126,6 +126,57 @@ def _write_debug_log(message: str) -> None:
         pass
 
 
+_FAILED_RECORDS_FILENAME = "failed_user_works.json"
+
+
+def _failed_records_path(config: ConfigLoader) -> Path:
+    output_path = config.get("path") or "."
+    return Path(output_path) / _FAILED_RECORDS_FILENAME
+
+
+def _load_failed_record(config: ConfigLoader, sec_uid: str) -> Optional[dict]:
+    path = _failed_records_path(config)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        record = data.get("records", {}).get(sec_uid)
+        if record and record.get("items"):
+            return record
+    except Exception as exc:
+        _write_debug_log(f"load failed record error: {exc}")
+    return None
+
+
+def _save_failed_record(config: ConfigLoader, sec_uid: str, record: dict) -> None:
+    path = _failed_records_path(config)
+    try:
+        data: dict = {"records": {}}
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {"records": {}}
+        records = data.setdefault("records", {})
+        records[sec_uid] = record
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        _write_debug_log(f"save failed record error: {exc}")
+
+
+def _remove_failed_record(config: ConfigLoader, sec_uid: str) -> None:
+    path = _failed_records_path(config)
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        records = data.get("records", {})
+        if sec_uid in records:
+            del records[sec_uid]
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        _write_debug_log(f"remove failed record error: {exc}")
+
+
 def _is_rate_limited(resp: dict) -> bool:
     """判断接口是否因请求频繁而被风控。"""
     status_code = resp.get("status_code", 0)
@@ -185,51 +236,70 @@ async def _fetch_from_api(
     config: ConfigLoader,
     out: BridgeOutput,
     cookie_file: str,
-) -> List[dict]:
-    """通过抖音 API 直接拉取作品列表。"""
+    initial_cursor: int = 0,
+    is_retry: bool = False,
+) -> dict:
+    """通过抖音 API 低速拉取作品列表。遇到风控/空页/游标卡住时直接失败，不再浏览器兜底。
+
+    返回字典包含：
+    - items: 拉取到的作品列表
+    - has_more: API 是否声明还有下一页
+    - cursor: 最后使用的游标
+    - stopped_reason: 提前终止的原因（rate_limited / empty_page / cursor_stall / limit_reached / none）
+    """
     Path(cookie_file).parent.mkdir(parents=True, exist_ok=True)
     cookie_manager = CookieManager(cookie_file=cookie_file)
     if cookies:
         cookie_manager.set_cookies(cookies)
-    # 作者作品是交互式查询，限速要比后台批量同步更保守
-    rate_limiter = RateLimiter(max_per_second=0.7)
+    # 用户要求重试时更慢，降低触发风控概率
+    rate_limiter = RateLimiter(max_per_second=0.3)
 
     results: List[dict] = []
-    cursor = 0
+    cursor = initial_cursor
     page = 0
     has_more = True
     empty_retries = 0
     cursor_retries = 0
     rate_limit_backoff = 0
+    stopped_reason: Optional[str] = None
 
     async with DouyinAPIClient(
         cookie_manager.get_cookies(),
         proxy=proxy or None,
         config=config.config if config else {},
     ) as api:
+        if is_retry:
+            cooldown = random.uniform(30, 60)
+            out.emit("log", {"level": "warning", "message": f"失败重试，先冷却 {cooldown:.0f}s 再以低速继续..."})
+            await asyncio.sleep(cooldown)
+
         while has_more and (limit <= 0 or len(results) < limit):
             page += 1
             await rate_limiter.acquire()
-            out.emit("progress", {"current": len(results), "total": limit or 0, "message": f"第 {page} 页"})
+            action = "继续" if is_retry else "获取"
+            out.emit("progress", {"current": len(results), "total": limit or 0, "message": f"第 {page} 页（{action}）"})
 
             resp = await api.get_user_post(sec_uid, max_cursor=cursor, count=18)
             status_code = resp.get("status_code", 0)
             status_msg = resp.get("status_msg", "")
+            page_has_more = bool(resp.get("has_more", False))
             _write_debug_log(
                 f"page={page} cursor={cursor} status_code={status_code} "
-                f"msg={status_msg} has_more={resp.get('has_more')} "
+                f"msg={status_msg} has_more={page_has_more} "
                 f"items={len(resp.get('items') or resp.get('aweme_list') or [])}"
             )
 
             if _is_rate_limited(resp):
                 rate_limit_backoff = min(rate_limit_backoff + 1, 5)
-                wait = min(2 ** rate_limit_backoff + random.uniform(0, 1), 60)
+                wait = min(2 ** rate_limit_backoff + random.uniform(0, 1), 120)
                 out.emit(
                     "log",
                     {"level": "warning", "message": f"触发接口风控，{wait:.1f}s 后重试（第 {rate_limit_backoff} 次）"},
                 )
-                if rate_limit_backoff >= 4:
+                if rate_limit_backoff >= 3:
                     out.emit("log", {"level": "error", "message": "接口请求过于频繁，已停止获取，请稍后再试"})
+                    has_more = True
+                    stopped_reason = "rate_limited"
                     break
                 await asyncio.sleep(wait)
                 continue
@@ -243,138 +313,59 @@ async def _fetch_from_api(
             items = resp.get("items") or resp.get("aweme_list") or []
             if items:
                 formatted = [_format_aweme(it) for it in items]
+                if limit > 0:
+                    formatted = formatted[:limit - len(results)]
                 results.extend(formatted)
                 out.emit("items", {"items": formatted, "total": len(results)})
                 empty_retries = 0
                 cursor_retries = 0
-            elif page == 1 and empty_retries < 2:
+            elif page == 1 and empty_retries < 1:
                 empty_retries += 1
                 out.emit("log", {"level": "warning", "message": f"首页为空，第 {empty_retries} 次重试..."})
                 _write_debug_log(f"first page empty, retry {empty_retries}")
-                await asyncio.sleep(1.0 + empty_retries * 0.8)
+                await asyncio.sleep(3.0 + empty_retries * 2.0)
+                continue
+            elif page_has_more and empty_retries < 2:
+                # API 声明还有下一页但本页为空，可能是 transient 风控或数据抖动，继续重试
+                empty_retries += 1
+                out.emit("log", {"level": "warning", "message": f"第 {page} 页返回为空但 has_more=true，第 {empty_retries} 次重试..."})
+                _write_debug_log(f"page {page} empty but has_more, retry {empty_retries}")
+                await asyncio.sleep(4.0 + empty_retries * 2.0)
                 continue
             else:
+                stopped_reason = "empty_page"
                 break
 
-            has_more = bool(resp.get("has_more", False))
+            has_more = page_has_more
             next_cursor = resp.get("max_cursor", 0)
 
             if has_more and next_cursor == cursor:
-                if cursor_retries < 2:
+                if cursor_retries < 1:
                     cursor_retries += 1
                     out.emit("log", {"level": "warning", "message": f"游标未推进，第 {cursor_retries} 次重试..."})
-                    await asyncio.sleep(1.0 + cursor_retries * 0.8)
+                    await asyncio.sleep(5.0 + cursor_retries * 2.0)
                     continue
+                stopped_reason = "cursor_stall"
                 break
 
             cursor = next_cursor
 
             if not has_more or (limit > 0 and len(results) >= limit):
+                if limit > 0 and len(results) >= limit:
+                    stopped_reason = "limit_reached"
                 break
 
             # 分页间隔比后台同步更保守，降低连续请求触发风控的概率
-            await asyncio.sleep(1.2 if page <= 3 else 2.0)
+            await asyncio.sleep(random.uniform(3.0, 5.0))
 
     if limit > 0 and len(results) > limit:
         results = results[:limit]
-    return results
-
-
-async def _recover_via_browser(
-    api: DouyinAPIClient,
-    sec_uid: str,
-    existing: List[dict],
-    limit: int,
-    config: ConfigLoader,
-    rate_limiter: RateLimiter,
-    out: BridgeOutput,
-) -> List[dict]:
-    """API 分页受限时，通过浏览器滚动用户主页采集作品并补全详情。
-
-    仅在用户显式开启「浏览器回补」时执行，避免未经用户同意弹窗。
-    """
-    browser_cfg = config.get("browser_fallback") or {}
-    if not browser_cfg.get("enabled", False):
-        out.log("浏览器兜底未启用，跳过", level="info")
-        return existing
-
-    out.log("API 分页受限，启动浏览器兜底采集", level="warning")
-    out.emit("progress", {
-        "current": len(existing),
-        "total": limit or 0,
-        "message": "接口受限，启动浏览器兜底",
-    })
-
-    try:
-        browser_ids = await api.collect_user_post_ids_via_browser(
-            sec_uid,
-            expected_count=limit if limit > 0 else 0,
-            headless=bool(browser_cfg.get("headless", False)),
-            max_scrolls=int(browser_cfg.get("max_scrolls", 240) or 240),
-            idle_rounds=int(browser_cfg.get("idle_rounds", 8) or 8),
-            wait_timeout_seconds=int(browser_cfg.get("wait_timeout_seconds", 600) or 600),
-        )
-    except Exception as exc:
-        out.log(f"浏览器兜底失败：{exc}", level="error")
-        return existing
-
-    browser_items: Dict[str, Dict[str, Any]] = {}
-    if hasattr(api, "pop_browser_post_aweme_items"):
-        try:
-            browser_items = api.pop_browser_post_aweme_items() or {}
-        except Exception as exc:
-            out.log(f"复用浏览器缓存作品失败：{exc}", level="warning")
-
-    if not browser_ids:
-        out.log("浏览器兜底未采集到作品 ID", level="warning")
-        return existing
-
-    out.emit("progress", {
-        "current": len(existing),
-        "total": limit or len(existing) + len(browser_ids),
-        "message": f"浏览器已采集 {len(browser_ids)} 个作品，补全详情中",
-    })
-
-    existing_ids = {str(it.get("aweme_id")) for it in existing if it.get("aweme_id")}
-    results = list(existing)
-    reused = detail_success = detail_failed = 0
-
-    for idx, aweme_id in enumerate(browser_ids, start=1):
-        if limit > 0 and len(results) >= limit:
-            break
-        aweme_id_str = str(aweme_id)
-        if aweme_id_str in existing_ids:
-            continue
-        existing_ids.add(aweme_id_str)
-
-        detail = browser_items.get(aweme_id_str)
-        if detail:
-            reused += 1
-        else:
-            await rate_limiter.acquire()
-            detail = await api.get_video_detail(aweme_id_str, suppress_error=True)
-            if detail:
-                detail_success += 1
-            else:
-                detail_failed += 1
-
-        if not detail:
-            continue
-
-        author = detail.get("author") or {}
-        if author.get("sec_uid") and str(author["sec_uid"]) != str(sec_uid):
-            out.log(f"作品 {aweme_id_str} 的 sec_uid 不匹配，跳过", level="warning")
-            continue
-
-        formatted = _format_aweme(detail)
-        results.append(formatted)
-        out.emit("items", {"items": [formatted], "total": len(results)})
-
-    out.log(
-        f"浏览器兜底完成：复用 {reused}，详情成功 {detail_success}，失败 {detail_failed}",
-        level="info",
-    )
-    return results
+    return {
+        "items": results,
+        "has_more": has_more,
+        "cursor": cursor,
+        "stopped_reason": stopped_reason,
+    }
 
 
 async def _fetch_user_works(
@@ -386,12 +377,35 @@ async def _fetch_user_works(
     out: BridgeOutput,
     cookie_file: str = ".cookies.json",
     force_refresh: bool = False,
-) -> List[dict]:
+    expected_total: int = 0,
+    retry: bool = False,
+    nickname: str = "",
+) -> dict:
+    """获取博主作品列表。失败时记录失败信息，不再浏览器兜底，重试时低速续传。"""
     _write_debug_log(
-        f"start sec_uid={sec_uid} limit={limit} proxy={proxy} force_refresh={force_refresh} cookies_keys={list(cookies.keys())}"
+        f"start sec_uid={sec_uid} limit={limit} expected_total={expected_total} "
+        f"retry={retry} proxy={proxy} force_refresh={force_refresh} cookies_keys={list(cookies.keys())}"
     )
 
-    # 1. 优先从本地数据库读取（不联网、不弹窗）；强制刷新时跳过缓存
+    output_path = config.get("path") or "."
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+
+    # 1. 重试时读取上次失败记录
+    recorded_items: List[dict] = []
+    initial_cursor = 0
+    is_retry = False
+    if retry and not force_refresh:
+        failure_record = _load_failed_record(config, sec_uid)
+        if failure_record:
+            recorded_items = failure_record.get("items") or []
+            initial_cursor = int(failure_record.get("cursor") or 0)
+            is_retry = True
+            out.emit("log", {
+                "level": "info",
+                "message": f"读取到失败记录，已缓存 {len(recorded_items)} 个作品，将从游标 {initial_cursor} 继续",
+            })
+
+    # 2. 优先从本地数据库读取；强制刷新时跳过缓存
     db_results: List[dict] = []
     if not force_refresh:
         db_results = await _load_existing_awemes_from_db(sec_uid, config)
@@ -405,61 +419,88 @@ async def _fetch_user_works(
             # 缓存已满足请求数量，直接返回
             if limit > 0 and len(db_results) >= limit:
                 _write_debug_log(f"db cache satisfied limit, total={len(db_results)}")
-                return db_results[:limit]
+                _remove_failed_record(config, sec_uid)
+                return {
+                    "items": db_results[:limit],
+                    "is_complete": True,
+                    "expected_total": expected_total,
+                    "actual_total": len(db_results[:limit]),
+                    "failed_count": 0,
+                    "source_counts": {"db": len(db_results), "recorded": 0, "api": 0},
+                }
 
-    # 2. 缓存不足或强制刷新时，调用 API 补充/获取数据
+    # 3. 缓存不足或强制刷新时，调用 API 低速补充/获取数据
     need_count = limit
     if not force_refresh and db_results and limit > 0:
         need_count = limit - len(db_results)
         _write_debug_log(f"db cache partial, need {need_count} more from api")
 
-    api_results = await _fetch_from_api(
-        sec_uid, cookies, proxy, need_count if need_count > 0 else limit, config, out, cookie_file
+    api_info = await _fetch_from_api(
+        sec_uid, cookies, proxy, need_count if need_count > 0 else limit, config, out, cookie_file,
+        initial_cursor=initial_cursor, is_retry=is_retry,
     )
+    api_results: List[dict] = api_info.get("items", [])
+    api_has_more: bool = bool(api_info.get("has_more", False))
+    api_stopped: Optional[str] = api_info.get("stopped_reason")
+    last_cursor = int(api_info.get("cursor") or 0)
 
-    if not api_results:
+    if not api_results and not db_results and not recorded_items:
         out.emit("progress", {
-            "current": len(db_results),
-            "total": limit or len(db_results),
+            "current": 0,
+            "total": limit or 0,
             "message": "接口未返回数据，请检查 Cookie 或稍后刷新",
         })
 
-    # 3. API 未拿够且用户开启浏览器兜底，才启动浏览器
-    current_results = db_results + api_results
-    if (limit <= 0 or len(current_results) < limit) and not api_results:
-        browser_cfg = config.get("browser_fallback") or {}
-        if browser_cfg.get("enabled", False):
-            Path(cookie_file).parent.mkdir(parents=True, exist_ok=True)
-            cookie_manager = CookieManager(cookie_file=cookie_file)
-            cookie_manager.set_cookies(cookies)
-            rate_limiter = RateLimiter(max_per_second=1.5)
-            async with DouyinAPIClient(
-                cookie_manager.get_cookies(),
-                proxy=proxy or None,
-                config=config.config if config else {},
-            ) as api:
-                browser_results = await _recover_via_browser(
-                    api, sec_uid, api_results, limit, config, rate_limiter, out
-                )
-                if browser_results:
-                    # 合并浏览器兜底结果，去重
-                    seen = {item.get("aweme_id") for item in current_results if item.get("aweme_id")}
-                    for item in browser_results:
-                        aweme_id = item.get("aweme_id")
-                        if aweme_id and aweme_id in seen:
-                            continue
-                        seen.add(aweme_id)
-                        api_results.append(item)
-        elif not db_results:
-            out.log("API 未返回数据且浏览器兜底未启用，如需兜底请在设置中开启", level="warning")
-
-    # 4. 合并数据库缓存与 API 结果，按 create_time 降序去重
-    merged = _merge_aweme_results(db_results, api_results)
+    # 4. 合并数据库缓存 + 已记录缓存 + API 结果
+    merged = _merge_aweme_results(db_results, recorded_items + api_results)
     if limit > 0 and len(merged) > limit:
         merged = merged[:limit]
 
-    _write_debug_log(f"done total={len(merged)} (db={len(db_results)}, api={len(api_results)})")
-    return merged
+    actual_total = len(merged)
+    target_count = expected_total if expected_total > 0 else limit
+    if target_count > 0:
+        is_complete = actual_total >= target_count
+        failed_count = max(0, target_count - actual_total)
+    else:
+        is_complete = not api_has_more and api_stopped != "rate_limited"
+        failed_count = 0
+
+    if is_complete:
+        _remove_failed_record(config, sec_uid)
+    else:
+        _save_failed_record(config, sec_uid, {
+            "sec_uid": sec_uid,
+            "nickname": nickname,
+            "expected_total": expected_total,
+            "actual_total": actual_total,
+            "failed_count": failed_count,
+            "cursor": last_cursor,
+            "has_more": api_has_more,
+            "stopped_reason": api_stopped,
+            "items": merged,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        out.emit("log", {
+            "level": "error",
+            "message": f"拉取不完整：已获取 {actual_total}/{target_count} 个作品，失败 {failed_count} 个，已记录失败信息",
+        })
+
+    _write_debug_log(
+        f"done total={actual_total} complete={is_complete} failed={failed_count} "
+        f"(db={len(db_results)}, recorded={len(recorded_items)}, api={len(api_results)})"
+    )
+    return {
+        "items": merged,
+        "is_complete": is_complete,
+        "expected_total": expected_total,
+        "actual_total": actual_total,
+        "failed_count": failed_count,
+        "source_counts": {
+            "db": len(db_results),
+            "recorded": len(recorded_items),
+            "api": len(api_results),
+        },
+    }
 
 
 def main(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
@@ -475,7 +516,10 @@ def main(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
 
     config = _build_config(job)
     limit = int(job.get("limit") or 0)
+    expected_total = int(job.get("expected_total") or 0)
     proxy = str(job.get("proxy") or config.get("proxy") or "")
+    nickname = str(job.get("nickname") or "")
+    retry = bool(job.get("retry", False))
 
     cookie_file = str(job.get("cookieFile") or "").strip()
     if not cookie_file:
@@ -485,19 +529,44 @@ def main(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
     else:
         Path(cookie_file).parent.mkdir(parents=True, exist_ok=True)
 
-    out.emit("start", {"sec_uid": sec_uid, "limit": limit})
+    out.emit("start", {"sec_uid": sec_uid, "limit": limit, "expected_total": expected_total, "retry": retry})
 
     force_refresh = bool(job.get("force_refresh", False))
     try:
-        results = asyncio.run(_fetch_user_works(
-            sec_uid, cookies, limit, proxy, config, out, cookie_file=cookie_file, force_refresh=force_refresh
+        result = asyncio.run(_fetch_user_works(
+            sec_uid, cookies, limit, proxy, config, out,
+            cookie_file=cookie_file, force_refresh=force_refresh, expected_total=expected_total,
+            retry=retry, nickname=nickname,
         ))
     except Exception as exc:
         out.error(f"获取作品失败：{exc}")
         return
 
-    out.emit("done", {"total": len(results), "items": results})
-    out.finished(success=True, data={"total": len(results)})
+    items = result.get("items", [])
+    is_complete = bool(result.get("is_complete", True))
+    actual_total = int(result.get("actual_total", len(items)))
+    failed_count = int(result.get("failed_count", 0))
+    source_counts = result.get("source_counts", {})
+
+    out.emit("done", {
+        "total": actual_total,
+        "items": items,
+        "is_complete": is_complete,
+        "expected_total": expected_total,
+        "failed_count": failed_count,
+        "source_counts": source_counts,
+    })
+    # success 保持 true：未完整获取不是程序异常，前端根据 is_complete 展示失败/重试提示
+    out.finished(
+        success=True,
+        data={
+            "total": actual_total,
+            "is_complete": is_complete,
+            "expected_total": expected_total,
+            "failed_count": failed_count,
+            "source_counts": source_counts,
+        },
+    )
 
 
 if __name__ == "__main__":

@@ -54,12 +54,11 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         aweme_list: List[Dict[str, Any]] = []
         max_cursor = 0
         has_more = True
-        pagination_restricted = False
 
         number_limit = int(self.downloader.config.get("number", {}).get(self.mode_name, 0) or 0)
         media_filter_enabled = self._media_type_filter_enabled()
 
-        # 抖音接口偶发空页 / 游标卡住，先重试再判定为受限。
+        # 抖音接口偶发空页 / 游标卡住，先重试再停止。
         max_api_retries = 3
         retry_count = 0
         processed_cursors: set[int] = set()
@@ -67,7 +66,7 @@ class PostUserModeStrategy(BaseUserModeStrategy):
         existing_ids = await self._load_existing_aweme_ids(sec_uid)
         if existing_ids:
             self.downloader._progress_update_step(
-                "拉取作品列表", f"已记录 {len(existing_ids)} 个已下载作品，将自动跳过"
+                "拉取作品列表", f"已记录 {len(existing_ids)} 个已下载作品，下载时将自动跳过"
             )
         else:
             self.downloader._progress_update_step("拉取作品列表", "分页抓取中")
@@ -88,14 +87,6 @@ class PostUserModeStrategy(BaseUserModeStrategy):
                         f"接口返回空页，第 {retry_count} 次重试...",
                     )
                     continue
-
-                if page.get("status_code") == 0:
-                    pagination_restricted = True
-                    logger.warning(
-                        "User post page empty at cursor=%s (status_code=0); "
-                        "will attempt browser fallback",
-                        request_cursor,
-                    )
                 break
 
             if request_cursor in processed_cursors:
@@ -108,23 +99,15 @@ class PostUserModeStrategy(BaseUserModeStrategy):
                 page_items = self._filter_pinned_items(page_items)
                 pinned_count = raw_page_count - len(page_items)
 
-                # 作品列表按时间倒序，若当前页全部已下载，后续页不可能再出现新作品，
-                # 直接停止翻页，避免无意义请求触发风控/浏览器回补。
-                page_has_new = self._page_has_new_items(page_items, existing_ids)
                 aweme_list.extend(page_items)
                 processed_cursors.add(request_cursor)
 
                 detail_parts = [f"已抓取 {len(aweme_list)} 条"]
                 if pinned_count > 0:
                     detail_parts.append(f"过滤置顶 {pinned_count} 条")
+                if existing_ids and not self._page_has_new_items(page_items, existing_ids):
+                    detail_parts.append(f"本页 {len(page_items)} 个已下载，继续翻页")
                 self.downloader._progress_update_step("拉取作品列表", "，".join(detail_parts))
-
-                if not page_has_new:
-                    self.downloader._progress_update_step(
-                        "拉取作品列表",
-                        f"本页 {len(page_items)} 个作品均已下载，停止翻页",
-                    )
-                    break
 
             has_more = bool(page.get("has_more", False))
             max_cursor = int(page.get("max_cursor", 0) or 0)
@@ -142,7 +125,6 @@ class PostUserModeStrategy(BaseUserModeStrategy):
                     "max_cursor did not advance (%s), stop paging to avoid loop",
                     max_cursor,
                 )
-                pagination_restricted = True
                 break
 
             if number_limit > 0:
@@ -153,13 +135,10 @@ class PostUserModeStrategy(BaseUserModeStrategy):
                     aweme_list = aweme_list[:number_limit]
                     break
 
-        if pagination_restricted:
-            self.downloader._progress_update_step("拉取作品列表", "分页受限，尝试浏览器回补")
-            await self.downloader._recover_user_post_with_browser(sec_uid, user_info, aweme_list)
-            if not aweme_list:
-                raise RuntimeError(
-                    "抖音接口未返回作品列表（可能触发了反爬限制），"
-                    "请稍后重试或尝试重新登录抖音刷新 Cookie"
-                )
+        if not aweme_list:
+            raise RuntimeError(
+                "抖音接口未返回作品列表（可能触发了反爬限制），"
+                "请稍后重试或尝试重新登录抖音刷新 Cookie"
+            )
 
         return aweme_list

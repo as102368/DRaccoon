@@ -182,11 +182,12 @@ async def _fetch_author_new_awemes(
     nickname: str,
     per_author_limit: int,
     existing_ids: Set[str],
+    cutoff_time: int,
     api: DouyinAPIClient,
     rate_limiter: RateLimiter,
     out: BridgeOutput,
 ) -> List[dict]:
-    """拉取单个博主的最新作品，过滤已下载的 aweme_id。"""
+    """拉取单个博主的最新作品，过滤已下载且超过 cutoff_time 的 aweme_id。"""
     results: List[dict] = []
     cursor = 0
     page = 0
@@ -223,11 +224,23 @@ async def _fetch_author_new_awemes(
             break
 
         page_has_new = False
+        reached_old = False
         for raw in items:
             formatted = _format_aweme(raw)
             aid = formatted.get("aweme_id")
             if not aid:
                 continue
+
+            create_time = formatted.get("create_time")
+            if create_time is not None:
+                try:
+                    create_time = int(create_time)
+                except Exception:
+                    create_time = None
+            if create_time is not None and create_time < cutoff_time:
+                reached_old = True
+                break
+
             if aid in existing_ids:
                 continue
             results.append(formatted)
@@ -239,8 +252,8 @@ async def _fetch_author_new_awemes(
         next_cursor = resp.get("max_cursor", 0)
         if not has_more or next_cursor == cursor:
             break
-        # 作品列表按时间倒序，当前页已无新作品时，后续页面不可能再出现新作品
-        if not page_has_new:
+        # 作品列表按时间倒序，当前页已无新作品或已遇到 cutoff 之前的作品时，后续页面不可能再出现新作品
+        if not page_has_new or reached_old:
             break
         cursor = next_cursor
 
@@ -350,10 +363,18 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
     limits = job.get("limits") or {}
     max_authors = int(limits.get("newReleasesAuthors") or 200)
     per_author_limit = int(limits.get("newReleasesPerAuthor") or 30)
-    # 博主来源：'all' = 全部关注博主（默认），'downloaded' = 仅已下载过的博主
-    author_source = str(limits.get("newReleasesAuthorSource") or "all").lower()
+    # 博主来源：'all' = 全部关注博主，'downloaded' = 仅已下载过的博主（默认）
+    author_source = str(limits.get("newReleasesAuthorSource") or "downloaded").lower()
     if author_source not in ("all", "downloaded"):
-        author_source = "all"
+        author_source = "downloaded"
+    # 只同步 N 天内发布的新作品，默认 7 天
+    try:
+        days = int(limits.get("newReleasesDays"))
+        if days < 1:
+            days = 7
+    except (TypeError, ValueError):
+        days = 7
+    cutoff_time = int(time.time()) - days * 86400
     proxy = str(job.get("proxy") or config.get("proxy") or "")
 
     try:
@@ -363,7 +384,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
         else:
             authors = await database.get_downloaded_following_authors(limit=max_authors)
             source_label = "已下载过的博主"
-        out.log(f"新发布博主来源：{source_label}，共 {len(authors)} 位（上限 {max_authors}）")
+        out.log(f"新发布博主来源：{source_label}，共 {len(authors)} 位（上限 {max_authors}），只同步近 {days} 天内作品")
         if not authors:
             out.log("没有匹配到关注博主，准备输出诊断信息")
             await _diagnose_empty_authors(database, out)
@@ -425,6 +446,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
                         nickname=nickname,
                         per_author_limit=per_author_limit,
                         existing_ids=existing_ids,
+                        cutoff_time=cutoff_time,
                         api=api,
                         rate_limiter=rate_limiter,
                         out=out,

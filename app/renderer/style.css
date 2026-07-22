@@ -16,6 +16,7 @@
   --accent: #1fb7d6;
   --accent-hover: #2bcde8;
   --danger: #ff4d6d;
+  --warning: #f5a623;
   --success: #2dd36f;
 }
 
@@ -32,6 +33,7 @@
   --accent: #1fb7d6;
   --accent-hover: #2bcde8;
   --danger: #ff4d6d;
+  --warning: #f5a623;
   --success: #2dd36f;
 }
 
@@ -49,6 +51,7 @@
   --accent: #0d9ac2;
   --accent-hover: #0b86ac;
   --danger: #e63950;
+  --warning: #d48906;
   --success: #1ca35a;
 }
 

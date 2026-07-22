@@ -60,3 +60,5 @@ rcedit-x64.exe
 test_task_status.js
 test_task_status.py
 test_ui_check.py
+pyinstaller-log.txt
+scripts/assets/dispatcher.spec

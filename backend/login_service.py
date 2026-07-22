@@ -75,6 +75,25 @@ async def validate(cookie_raw: str, profile: Optional[str] = None):
         emit({"valid": False, "reason": f"校验失败：{exc}"})
 
 
+def _redirect_to_files(stdout_log: Optional[str], stderr_log: Optional[str]):
+    if stdout_log:
+        try:
+            Path(stdout_log).parent.mkdir(parents=True, exist_ok=True)
+            sys.stdout = open(stdout_log, "w", encoding="utf-8", buffering=1)
+        except Exception as exc:
+            sys.stderr.write(f"无法重定向 stdout 到文件: {exc}\n")
+    if stderr_log:
+        try:
+            Path(stderr_log).parent.mkdir(parents=True, exist_ok=True)
+            sys.stderr = open(stderr_log, "w", encoding="utf-8", buffering=1)
+        except Exception as exc:
+            # 如果 stderr 重定向失败，至少尝试写到原始的 stderr
+            try:
+                sys.__stderr__.write(f"无法重定向 stderr 到文件: {exc}\n")
+            except Exception:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cookie", default="", help="完整 Cookie 字符串")
@@ -86,7 +105,11 @@ def main():
         metavar="NAME",
         help="保存 Cookie 到指定账号的配置文件（默认 .cookies.json；指定后为 .cookies.NAME.json）",
     )
+    parser.add_argument("--stdout-log", default=None, help="stdout 重定向目标日志文件")
+    parser.add_argument("--stderr-log", default=None, help="stderr 重定向目标日志文件")
     args = parser.parse_args()
+
+    _redirect_to_files(args.stdout_log, args.stderr_log)
 
     cookie = args.cookie
     if args.cookie_file:
@@ -95,7 +118,7 @@ def main():
         except Exception as exc:
             emit({"valid": False, "reason": f"读取 Cookie 文件失败：{exc}"})
             return
-    if not cookie:
+    if not cookie and sys.stdin is not None:
         cookie = sys.stdin.read()
 
     asyncio.run(validate(cookie, profile=args.profile))

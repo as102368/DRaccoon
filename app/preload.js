@@ -63,6 +63,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   restoreCloud: (payload) => ipcRenderer.invoke('cloud:restore', payload),
   cancelCloud: (taskId) => ipcRenderer.invoke('cloud:cancel', taskId),
 
+  // 作品去重
+  startDedup: (payload) => ipcRenderer.invoke('dedup:start', payload),
+  cancelDedup: (taskId) => ipcRenderer.invoke('dedup:cancel', taskId),
+
   // 全局快捷键
   onShortcutTriggered: (callback) => {
     const listener = (_event, payload) => callback(payload);
@@ -94,6 +98,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onCloudProgress: (callback) => makeListener('cloud:progress', callback),
   onCloudLog: (callback) => makeListener('cloud:log', callback),
   onCloudFinished: (callback) => makeListener('cloud:finished', callback),
+
+  // 事件监听：作品去重
+  onDedupProgress: (callback) => makeListener('dedup:progress', callback),
+  onDedupLog: (callback) => makeListener('dedup:log', callback),
+  onDedupFinished: (callback) => makeListener('dedup:finished', callback),
 
   // 事件监听：博主作品列表
   onUserWorksProgress: (callback) => makeListener('userWorks:progress', callback),

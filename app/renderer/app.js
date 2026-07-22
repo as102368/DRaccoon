@@ -186,6 +186,7 @@ const defaultSettings = {
   folderstyle: false,
   filenameTemplate: '{日期}_{标题}',
   videoQuality: 'highest',
+  queueUrlMaxRuntimeMinutes: 30,
   syncLimits: {
     favorites: 1000,
     collections: 200,
@@ -194,7 +195,8 @@ const defaultSettings = {
     topics: 200,
     newReleasesAuthors: 200,
     newReleasesPerAuthor: 30,
-    newReleasesAuthorSource: 'all',
+    newReleasesAuthorSource: 'downloaded',
+    newReleasesDays: 7,
   },
   retention: 'forever',
   theme: 'dark',
@@ -238,6 +240,7 @@ const store = reactive({
   relationTasks: [],
   reportTasks: [],
   cloudTasks: [],
+  dedupTasks: [],
   userWorks: [],
   newReleases: {
     status: 'idle',
@@ -316,6 +319,7 @@ function flushSaveTaskHistory() {
       ...store.relationTasks,
       ...store.reportTasks,
       ...store.cloudTasks,
+      ...store.dedupTasks,
     ].map(store.serializeTaskForHistory);
     const trimmed = all.slice(0, MAX_HISTORY_TASKS);
     localStorage.setItem(TASK_HISTORY_KEY, JSON.stringify(trimmed));
@@ -340,6 +344,7 @@ store.loadTaskHistory = () => {
     const relationTasks = [];
     const reportTasks = [];
     const cloudTasks = [];
+    const dedupTasks = [];
     valid.forEach(t => {
       // 重启时仍在运行中的任务已无法继续，标记为异常终止
       if (t.status === 'running' || t.status === 'cancelling') {
@@ -351,12 +356,14 @@ store.loadTaskHistory = () => {
       else if (t.id.startsWith('relation-')) relationTasks.push(reactive(t));
       else if (t.id.startsWith('report-')) reportTasks.push(reactive(t));
       else if (t.id.startsWith('cloud-')) cloudTasks.push(reactive(t));
+      else if (t.id.startsWith('dedup-')) dedupTasks.push(reactive(t));
     });
     store.tasks = tasks;
     store.syncs = syncs;
     store.relationTasks = relationTasks;
     store.reportTasks = reportTasks;
     store.cloudTasks = cloudTasks;
+    store.dedupTasks = dedupTasks;
   } catch (e) {
     console.error('加载任务历史失败', e);
   }
@@ -846,12 +853,15 @@ store.onSyncFinished = async (payload) => {
 
 store.recoverStalledSyncs = () => {
   const now = Date.now();
+  // 新发布同步需要遍历大量博主，正常耗时可能超过 5 分钟，给更长的阈值
   const STALL_TIMEOUT_MS = 5 * 60 * 1000;
+  const NEW_RELEASES_STALL_TIMEOUT_MS = 15 * 60 * 1000;
   let changed = false;
   for (const sync of store.syncs) {
     if (sync.status !== 'running' && sync.status !== 'cancelling') continue;
+    const timeout = sync.kind === 'newReleases' ? NEW_RELEASES_STALL_TIMEOUT_MS : STALL_TIMEOUT_MS;
     const last = sync.lastProgressAt || sync.createdAtMs || now;
-    if (now - last > STALL_TIMEOUT_MS) {
+    if (now - last > timeout) {
       sync.status = 'error';
       sync.step = '同步卡住，请重新尝试';
       if (sync.kind === 'newReleases' && store.newReleases.taskId === sync.id) {
@@ -900,7 +910,7 @@ store.saveSyncCache = async (kind, data) => {
 // ========== 博主作品列表任务 ==========
 const USER_WORKS_STALL_MS = 30000;
 
-store.startUserWorks = async (secUid, nickname, forceRefresh = false) => {
+store.startUserWorks = async (secUid, nickname, forceRefresh = false, expectedTotal = 0, retry = false) => {
   const id = 'userWorks-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9);
   // 清理该作者已结束的历史任务，避免列表无限增长并防止旧空任务干扰判断
   store.userWorks = store.userWorks.filter(t => !(t.secUid === secUid && t.status !== 'running' && t.status !== 'cancelling'));
@@ -912,7 +922,7 @@ store.startUserWorks = async (secUid, nickname, forceRefresh = false) => {
     progress: 0,
     total: 0,
     items: [],
-    step: '准备中',
+    step: retry ? '准备低速重试' : '准备中',
     logs: [],
     createdAt: new Date().toLocaleString(),
     lastProgressAt: Date.now(),
@@ -924,7 +934,10 @@ store.startUserWorks = async (secUid, nickname, forceRefresh = false) => {
       secUid,
       nickname: nickname || secUid,
       cookies: store.settings.cookieString,
-      limit: store.settings.syncLimits.following || 200,
+      // 单个博主作品不应用 following 列表同步上限，传 0 表示不限制，靠 expectedTotal 判断完整度
+      limit: 0,
+      expectedTotal,
+      retry,
       proxy: store.settings.proxy || '',
       config: plain(store.buildConfig()),
       forceRefresh,
@@ -1007,17 +1020,29 @@ store.onUserWorksFinished = (payload) => {
   if (task.status !== 'running' && task.status !== 'cancelling') return;
   const gotItems = (task.items && task.items.length > 0) || (data && data.total > 0);
   const backendError = data && (data.success === false || (typeof data.error === 'string' && data.error));
+  const isComplete = !data || data.is_complete !== false;
+  const expectedTotal = data && data.expected_total ? data.expected_total : 0;
+  const failedCount = data && typeof data.failed_count === 'number' ? data.failed_count : 0;
   if (task.status === 'cancelling') {
     task.status = 'cancelled';
     task.step = '已取消';
-  } else if (code === 0 && gotItems && !backendError) {
+  } else if (code !== 0 || backendError) {
+    task.status = 'error';
+    task.step = backendError ? `获取失败：${data.error}` : `获取失败（code=${code}）`;
+  } else if (!isComplete) {
+    task.status = 'failed';
+    const actual = task.items.length;
+    task.step = expectedTotal
+      ? `拉取失败：已获取 ${actual}/${expectedTotal} 个作品，失败 ${failedCount} 个`
+      : `拉取失败：已获取 ${actual} 个作品，可能未完整`;
+  } else if (!gotItems) {
+    task.status = 'error';
+    task.step = '未获取到作品';
+  } else {
     task.status = 'success';
     if (!task.step || !task.step.includes('个作品')) {
       task.step = `共 ${task.items.length} 个作品`;
     }
-  } else {
-    task.status = 'error';
-    task.step = backendError ? `获取失败：${data.error}` : (gotItems ? `获取失败（code=${code}）` : '未获取到作品');
   }
 };
 
@@ -1155,7 +1180,11 @@ store.onNewReleasesLog = (payload) => {
   if (!line) return;
   store.newReleases.logs.push(line);
   const sync = store.syncs.find(s => s.id === store.newReleases.taskId);
-  if (sync) sync.logs.push(line);
+  if (sync) {
+    sync.logs.push(line);
+    // 后端持续输出日志也说明进程仍在工作，刷新进度时间避免被误判为卡住
+    sync.lastProgressAt = Date.now();
+  }
 };
 
 store.onNewReleasesFinished = (payload) => {
@@ -1601,6 +1630,113 @@ store.onCloudFinished = (payload) => {
   store.saveTaskHistory();
 };
 
+// ========== 作品去重任务 ==========
+store.startDedupTask = async (outputDir) => {
+  const id = 'dedup-' + Date.now();
+  const nowMs = Date.now();
+  const task = reactive({
+    id,
+    status: 'running',
+    progress: 0,
+    step: '准备中',
+    total: 0,
+    scanned: 0,
+    duplicateGroups: 0,
+    duplicateFiles: 0,
+    deletedFiles: 0,
+    freedBytes: 0,
+    logs: [],
+    createdAt: new Date(nowMs).toLocaleString(),
+    createdAtMs: nowMs,
+  });
+  store.dedupTasks.unshift(task);
+  store.saveTaskHistory();
+  try {
+    const result = await window.electronAPI.startDedup({
+      taskId: id,
+      outputDir,
+    });
+    if (!result || result.started === false) {
+      task.status = 'error';
+      task.step = `启动失败：${result && result.error ? result.error : '未知错误'}`;
+      store.saveTaskHistory();
+    }
+  } catch (err) {
+    task.status = 'error';
+    task.step = `启动失败：${err && err.message ? err.message : err}`;
+    store.saveTaskHistory();
+  }
+  return id;
+};
+
+store.cancelDedupTask = (id) => {
+  const task = store.dedupTasks.find(t => t.id === id);
+  if (task && task.status === 'running') {
+    task.status = 'cancelling';
+    window.electronAPI.cancelDedup(id);
+  }
+};
+
+store.onDedupProgress = (payload) => {
+  const { taskId, data } = payload;
+  const task = store.dedupTasks.find(t => t.id === taskId);
+  if (!task) return;
+  if (task.status !== 'running' && task.status !== 'cancelling') return;
+  if (data.event === 'progress') {
+    task.step = data.message || '去重中';
+    if (typeof data.current === 'number' && typeof data.total === 'number' && data.total > 0) {
+      task.scanned = data.current;
+      task.total = data.total;
+      task.progress = Math.round((data.current / data.total) * 100);
+    }
+  } else if (data.event === 'stats') {
+    if (typeof data.duplicateGroups === 'number') task.duplicateGroups = data.duplicateGroups;
+    if (typeof data.duplicateFiles === 'number') task.duplicateFiles = data.duplicateFiles;
+    if (typeof data.deletedFiles === 'number') task.deletedFiles = data.deletedFiles;
+    if (typeof data.freedBytes === 'number') task.freedBytes = data.freedBytes;
+  } else if (data.event === 'log') {
+    task.logs.push(data.message);
+  } else if (data.event === 'finished') {
+    if (typeof data.duplicateGroups === 'number') task.duplicateGroups = data.duplicateGroups;
+    if (typeof data.duplicateFiles === 'number') task.duplicateFiles = data.duplicateFiles;
+    if (typeof data.deletedFiles === 'number') task.deletedFiles = data.deletedFiles;
+    if (typeof data.freedBytes === 'number') task.freedBytes = data.freedBytes;
+    task.progress = 100;
+  }
+};
+
+store.onDedupLog = (payload) => {
+  const { taskId, line } = payload;
+  const task = store.dedupTasks.find(t => t.id === taskId);
+  if (task) task.logs.push(line);
+};
+
+store.onDedupFinished = (payload) => {
+  const { taskId, code, data } = payload;
+  const task = store.dedupTasks.find(t => t.id === taskId);
+  if (!task) return;
+  if (task.status !== 'running' && task.status !== 'cancelling') return;
+  if (data) {
+    if (typeof data.duplicateGroups === 'number') task.duplicateGroups = data.duplicateGroups;
+    if (typeof data.duplicateFiles === 'number') task.duplicateFiles = data.duplicateFiles;
+    if (typeof data.deletedFiles === 'number') task.deletedFiles = data.deletedFiles;
+    if (typeof data.freedBytes === 'number') task.freedBytes = data.freedBytes;
+  }
+  const succeeded = code === 0 && data && data.success !== false;
+  if (task.status === 'cancelling') {
+    task.status = 'cancelled';
+    task.step = '已取消';
+  } else if (succeeded) {
+    task.status = 'success';
+    task.step = `完成：发现 ${task.duplicateGroups} 组重复，删除 ${task.deletedFiles} 个文件`;
+    task.progress = 100;
+  } else {
+    task.status = 'error';
+    task.step = data && data.error ? `失败：${data.error}` : `失败（code=${code}）`;
+  }
+  store.saveTaskHistory();
+};
+
 store.loadArchive = async () => {
   store.archive = await window.electronAPI.listArchive(store.settings.outputPath);
 };
@@ -1946,7 +2082,7 @@ const PageFollowing = {
     }
 
     // ========== 博主作品弹窗 ==========
-    const userWorksModal = ref({ open: false, secUid: '', nickname: '', avatar: '' });
+    const userWorksModal = ref({ open: false, secUid: '', nickname: '', avatar: '', expectedTotal: 0 });
     const worksSearch = ref('');
     const worksPage = ref(1);
     const worksPageSize = ref(20);
@@ -1979,25 +2115,29 @@ const PageFollowing = {
         console.warn('[openUserWorks] missing user or sec_uid', user);
         return;
       }
-      userWorksModal.value = { open: true, secUid: user.sec_uid, nickname: user.nickname, avatar: user.avatar };
+      const expectedTotal = user.aweme_count || user.video_count || 0;
+      userWorksModal.value = { open: true, secUid: user.sec_uid, nickname: user.nickname, avatar: user.avatar, expectedTotal };
       worksSearch.value = '';
       worksPage.value = 1;
-      const existing = s.userWorks.find(t => t.secUid === user.sec_uid && (t.status === 'success' || t.status === 'running'));
+      const existing = s.userWorks.find(t => t.secUid === user.sec_uid && (t.status === 'success' || t.status === 'running' || t.status === 'partial' || t.status === 'failed'));
       if (!existing) {
         console.log('[openUserWorks] no existing task, starting', user.sec_uid);
-        s.startUserWorks(user.sec_uid, user.nickname);
-      } else if (existing.status === 'success' && (!existing.items || existing.items.length === 0)) {
-        console.log('[openUserWorks] existing success task empty, restarting', user.sec_uid);
-        s.startUserWorks(user.sec_uid, user.nickname);
+        s.startUserWorks(user.sec_uid, user.nickname, false, expectedTotal);
+      } else if ((existing.status === 'success' || existing.status === 'failed') && (!existing.items || existing.items.length === 0)) {
+        console.log('[openUserWorks] existing empty task, restarting', user.sec_uid);
+        s.startUserWorks(user.sec_uid, user.nickname, false, expectedTotal);
       } else if (existing.status === 'running' && !s.isUserWorksRunning(user.sec_uid)) {
         console.log('[openUserWorks] existing task stalled, restarting', user.sec_uid);
-        s.startUserWorks(user.sec_uid, user.nickname);
+        s.startUserWorks(user.sec_uid, user.nickname, false, expectedTotal);
       } else {
         console.log('[openUserWorks] using existing task', existing.id, existing.status, existing.items?.length);
       }
     }
     function closeUserWorks() {
-      userWorksModal.value = { open: false, secUid: '', nickname: '', avatar: '' };
+      userWorksModal.value = { open: false, secUid: '', nickname: '', avatar: '', expectedTotal: 0 };
+    }
+    function retryUserWorks() {
+      s.startUserWorks(userWorksModal.value.secUid, userWorksModal.value.nickname, false, userWorksModal.value.expectedTotal, true);
     }
     function downloadWork(item) {
       if (item.share_url) {
@@ -2161,7 +2301,7 @@ const PageFollowing = {
       showMore, moreMenuStyle, toggleMore, closeMore, openRemark, saveRemark, removeRemark, remarkInput,
       unfollowed, remarks, markUnfollowed, restoreFollowed, clearUnfollowed, copyHandle, statusText,
       userWorksModal, worksSearch, worksPage, worksPageSize, worksTask, worksTaskStatus,
-      worksList, worksTotalPages, worksPagedList, openUserWorks, closeUserWorks, downloadWork,
+      worksList, worksTotalPages, worksPagedList, openUserWorks, closeUserWorks, retryUserWorks, downloadWork,
     };
   },
   template: `
@@ -2325,13 +2465,15 @@ const PageFollowing = {
             <div class="user-works-subtitle">
               <span v-if="worksTaskStatus==='running'" class="syncing">{{ worksTask?.step || '获取中...' }}</span>
               <span v-else-if="worksTaskStatus==='error'" class="error">{{ worksTask?.step || '获取失败' }}</span>
+              <span v-else-if="worksTaskStatus==='failed'" class="error">{{ worksTask?.step || '拉取失败' }}</span>
               <span v-else>共 {{ worksList.length }} 个作品</span>
             </div>
           </div>
         </div>
         <div class="toolbar" style="padding-top:0">
           <div class="search-box"><span class="icon" v-html="$icons.search"></span><input v-model="worksSearch" placeholder="搜索作品标题" /></div>
-          <button class="btn" @click="worksTaskStatus==='running' ? s.cancelUserWorks(worksTask.id) : s.startUserWorks(userWorksModal.secUid, userWorksModal.nickname, true)">
+          <button v-if="worksTaskStatus==='failed'" class="btn btn-primary" @click="retryUserWorks">重试（慢速）</button>
+          <button class="btn" @click="worksTaskStatus==='running' ? s.cancelUserWorks(worksTask.id) : s.startUserWorks(userWorksModal.secUid, userWorksModal.nickname, true, userWorksModal.expectedTotal)">
             {{ worksTaskStatus==='running' ? '取消' : '刷新' }}
           </button>
         </div>
@@ -2405,13 +2547,13 @@ const PageFavorites = {
     const selectedCount = computed(() => selected.value.size);
 
     const allSelected = computed(() => {
-      const validItems = filteredList.value.filter(item => !isInvalid(item));
+      const validItems = paginatedList.value.filter(item => !isInvalid(item));
       return validItems.length > 0 && validItems.every(item => selected.value.has(itemKey(item)));
     });
 
     function toggleSelectAll() {
       const next = new Set(selected.value);
-      const validItems = filteredList.value.filter(item => !isInvalid(item));
+      const validItems = paginatedList.value.filter(item => !isInvalid(item));
       if (allSelected.value) {
         validItems.forEach(item => next.delete(itemKey(item)));
       } else {
@@ -2846,7 +2988,7 @@ const PageFavorites = {
           <button class="btn btn-primary" @click="syncCurrent" :disabled="loading || isCurrentSyncing" :title="syncCurrentLabel">{{ syncCurrentLabel }}</button>
           <button class="btn" @click="refreshCache" :disabled="loading || isAnySyncing" title="从本地缓存重新加载"><span v-html="$icons.rotateCw"></span> 刷新</button>
           <button v-if="filteredList.length>0" class="btn" @click="toggleSelectAll">
-            <span v-html="$icons.checkSquare" style="width:14px;height:14px;margin-right:4px"></span>{{ allSelected ? '取消全选' : '全选' }}
+            <span v-html="$icons.checkSquare" style="width:14px;height:14px;margin-right:4px"></span>{{ allSelected ? '取消全选' : '全选本页' }}
           </button>
           <button v-if="filteredList.length>0" class="btn btn-primary" :disabled="selectedCount===0" @click="downloadSelected">下载选中 ({{ selectedCount }})</button>
           <select class="btn page-size-select" v-model.number="pageSize" title="每页显示数量">
@@ -3005,19 +3147,6 @@ const PageFavorites = {
           <div class="drawer-row"><span>话题视频<br><small>1–2,000</small></span><input type="number" v-model.number="s.settings.syncLimits.topics" min="1" max="2000" /></div>
         </div>
         <div class="drawer-section">
-          <div class="drawer-section-title"><span class="dot dot-accent"></span>NEW RELEASES</div>
-          <p>新发布检查的范围。判定规则：作品 aweme_id 不在本地下载记录中即为新发布。</p>
-          <div class="drawer-row">
-            <span>博主来源<br><small>全部关注：能发现从未下载过的博主的新作品，但更慢</small></span>
-            <select v-model="s.settings.syncLimits.newReleasesAuthorSource">
-              <option value="all">全部关注博主</option>
-              <option value="downloaded">仅已下载过的博主</option>
-            </select>
-          </div>
-          <div class="drawer-row"><span>检查博主数<br><small>1–2,000</small></span><input type="number" v-model.number="s.settings.syncLimits.newReleasesAuthors" min="1" max="2000" /></div>
-          <div class="drawer-row"><span>每位博主最多新作品<br><small>1–100</small></span><input type="number" v-model.number="s.settings.syncLimits.newReleasesPerAuthor" min="1" max="100" /></div>
-        </div>
-        <div class="drawer-section">
           <div class="drawer-section-title"><span class="dot dot-purple"></span>RETENTION</div>
           <div class="drawer-row"><span>保留时长<br><small>超过时限的缓存条目将自动清理</small></span>
             <select v-model="s.settings.retention">
@@ -3051,6 +3180,7 @@ const PageNewReleases = {
     const selected = ref({});
     const loading = ref(false);
     const filtering = ref(false);
+    const showSettings = ref(false);
     const pageSize = ref(50);
     const currentPage = ref(1);
     const pageSizeOptions = [
@@ -3120,10 +3250,11 @@ const PageNewReleases = {
 
     const lastSyncTime = computed(() => cache.value.updated_at || null);
 
-    const authorSource = computed(() => s.settings.syncLimits?.newReleasesAuthorSource || 'all');
+    const authorSource = computed(() => s.settings.syncLimits?.newReleasesAuthorSource || 'downloaded');
+    const newReleasesDays = computed(() => s.settings.syncLimits?.newReleasesDays || 7);
     const emptySubtitle = computed(() => authorSource.value === 'all'
-      ? '关注列表中的博主最近没有未下载的新作品'
-      : '已下载过的博主最近没有发布新视频');
+      ? `关注列表中的博主近 ${newReleasesDays.value} 天内没有未下载的新作品`
+      : `已下载过的博主近 ${newReleasesDays.value} 天内没有发布新视频`);
 
     const syncStatusText = computed(() => {
       if (isCancelling.value) {
@@ -3238,9 +3369,9 @@ const PageNewReleases = {
     });
 
     return {
-      s, search, selected, selectedCount, loading, needsLogin, isRunning, isCancelling, isActive, isDone, isCancelled, isError,
+      s, search, selected, selectedCount, loading, showSettings, needsLogin, isRunning, isCancelling, isActive, isDone, isCancelled, isError,
       cache, displayItems, filteredItems, paginatedItems, allSelected, lastSyncTime, syncStatusText, countText,
-      emptySubtitle, authorSource, pageSize, pageSizeOptions, currentPage, totalPages,
+      emptySubtitle, authorSource, newReleasesDays, pageSize, pageSizeOptions, currentPage, totalPages,
       toggleSelect, toggleSelectAll, downloadItem, downloadSelected, deleteSelected, startSync, refreshCache, goPage,
     };
   },
@@ -3254,6 +3385,9 @@ const PageNewReleases = {
         </button>
         <button class="btn" :disabled="isActive || loading || needsLogin" @click="refreshCache" title="从本地缓存重新加载">
           <span :class="{spin: loading}" v-html="$icons.rotateCw"></span> {{ loading ? '加载中' : '刷新' }}
+        </button>
+        <button class="btn btn-icon" @click="showSettings = true" title="新发布设置">
+          <span v-html="$icons.settings"></span>
         </button>
         <button class="btn" v-if="isRunning" @click="s.cancelNewReleases()">取消</button>
       </div>
@@ -3310,6 +3444,34 @@ const PageNewReleases = {
           <div class="pages">
             <button :disabled="currentPage <= 1" @click="goPage(currentPage - 1)">‹</button>
             <button :disabled="currentPage >= totalPages" @click="goPage(currentPage + 1)">›</button>
+          </div>
+        </div>
+      </div>
+      <div class="drawer-overlay" v-if="showSettings" @click="showSettings=false"></div>
+      <div class="drawer" :class="{open: showSettings}">
+        <div class="drawer-header">
+          <h3>新发布设置</h3>
+          <button class="btn btn-icon" @click="showSettings=false" v-html="$icons.close"></button>
+        </div>
+        <div class="drawer-body">
+          <div class="drawer-section">
+            <div class="drawer-section-title"><span class="dot dot-accent"></span>SYNC LIMITS</div>
+            <p>只检查已下载过的博主，并只保留设定天数内发布且未下载的作品。</p>
+            <div class="drawer-row">
+              <span>博主来源<br><small>仅已下载：只关注本地有下载记录的博主</small></span>
+              <select v-model="s.settings.syncLimits.newReleasesAuthorSource">
+                <option value="downloaded">仅已下载过的博主</option>
+                <option value="all">全部关注博主</option>
+              </select>
+            </div>
+            <div class="drawer-row"><span>检查博主数<br><small>1–2,000</small></span><input type="number" v-model.number="s.settings.syncLimits.newReleasesAuthors" min="1" max="2000" /></div>
+            <div class="drawer-row"><span>每位博主最多新作品<br><small>1–100</small></span><input type="number" v-model.number="s.settings.syncLimits.newReleasesPerAuthor" min="1" max="100" /></div>
+            <div class="drawer-row"><span>只同步近 N 天<br><small>1–365</small></span><input type="number" v-model.number="s.settings.syncLimits.newReleasesDays" min="1" max="365" /></div>
+          </div>
+          <div class="drawer-section">
+            <div class="drawer-section-title"><span class="dot dot-danger"></span>CLEAR CACHE</div>
+            <p>仅清除本地新发布缓存，不会影响抖音侧的收藏/喜欢列表。</p>
+            <button class="btn clear-cache" @click="s.clearSyncCache('new_releases'); showSettings=false">清空缓存 <span>新发布</span></button>
           </div>
         </div>
       </div>
@@ -3449,6 +3611,7 @@ const PageTasks = {
       relation: { label: '关注/取关', key: 'relationTasks', empty: '暂无批量关注/取关任务', icon: 'users' },
       report: { label: '报表导出', key: 'reportTasks', empty: '暂无报表导出任务', icon: 'chart' },
       cloud: { label: '云同步', key: 'cloudTasks', empty: '暂无云同步任务', icon: 'cloud' },
+      dedup: { label: '去重任务', key: 'dedupTasks', empty: '暂无去重任务', icon: 'copy' },
     };
 
     const statusOptions = [
@@ -3522,6 +3685,7 @@ const PageTasks = {
       ...s.relationTasks,
       ...s.reportTasks,
       ...s.cloudTasks,
+      ...s.dedupTasks,
     ]);
 
     const runningCount = computed(() => allTasks.value.filter(t => t.status === 'running' || t.status === 'cancelling').length);
@@ -3580,6 +3744,7 @@ const PageTasks = {
       if (task.id.startsWith('report-')) return '下载报表导出';
       if (task.id.startsWith('cloud-backup-')) return '云端备份';
       if (task.id.startsWith('cloud-restore-')) return '云端恢复';
+      if (task.id.startsWith('dedup-')) return '作品去重';
       return '任务';
     }
 
@@ -3601,6 +3766,12 @@ const PageTasks = {
         return parts.length ? parts.join(' · ') : '导出下载记录报表';
       }
       if (task.id.startsWith('cloud-')) return task.kind === 'backup' ? '备份设置与数据库' : '通过 Token 恢复数据';
+      if (task.id.startsWith('dedup-')) {
+        const groups = task.duplicateGroups || 0;
+        const deleted = task.deletedFiles || 0;
+        const freed = task.freedBytes || 0;
+        return `${groups} 组重复 · 删除 ${deleted} 个文件 · 释放 ${formatSize(freed)}`;
+      }
       return '';
     }
 
@@ -3610,6 +3781,7 @@ const PageTasks = {
       if (task.id.startsWith('relation-')) return 'users';
       if (task.id.startsWith('report-')) return 'chart';
       if (task.id.startsWith('cloud-')) return 'cloud';
+      if (task.id.startsWith('dedup-')) return 'copy';
       return 'more';
     }
 
@@ -3663,6 +3835,18 @@ const PageTasks = {
       const h = Math.floor(min / 60);
       const m = min % 60;
       return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+
+    function formatSize(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0;
+      let size = bytes;
+      while (size >= 1024 && i < units.length - 1) {
+        size /= 1024;
+        i++;
+      }
+      return `${size.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
     }
 
     function taskOutputPath(task) {
@@ -3750,6 +3934,7 @@ const PageTasks = {
       if (task.id.startsWith('relation-')) return s.relationTasks;
       if (task.id.startsWith('report-')) return s.reportTasks;
       if (task.id.startsWith('cloud-')) return s.cloudTasks;
+      if (task.id.startsWith('dedup-')) return s.dedupTasks;
       if (task.id.startsWith('userWorks-')) return s.userWorks;
       return null;
     }
@@ -3778,6 +3963,7 @@ const PageTasks = {
       else if (task.id.startsWith('relation-')) s.cancelRelationTask(task.id);
       else if (task.id.startsWith('report-')) s.cancelReport(task.id);
       else if (task.id.startsWith('cloud-')) s.cancelCloud(task.id);
+      else if (task.id.startsWith('dedup-')) s.cancelDedupTask(task.id);
       else if (task.id.startsWith('userWorks-')) s.cancelUserWorks(task.id);
       menuOpen.value = null;
     }
@@ -3806,6 +3992,8 @@ const PageTasks = {
         s.backupCloud();
       } else if (rawTask.id.startsWith('cloud-restore-') && rawTask.token) {
         s.restoreCloud(rawTask.token);
+      } else if (rawTask.id.startsWith('dedup-')) {
+        s.startDedupTask(s.settings.outputPath);
       }
       menuOpen.value = null;
     }
@@ -3984,6 +4172,7 @@ const PageTasks = {
       taskTime,
       taskLatestLog,
       taskDuration,
+      formatSize,
       taskOutputPath,
       openOutput,
       isRunning,
@@ -4155,6 +4344,12 @@ const PageTasks = {
                   <span class="chip chip-failed">失败 {{ task.summary?.failed || 0 }}</span>
                   <span class="chip">跳过 {{ task.summary?.skipped || 0 }}</span>
                 </template>
+                <template v-else-if="task.id.startsWith('dedup-')">
+                  <span class="chip">扫描 {{ task.scanned || 0 }} / {{ task.total || 0 }}</span>
+                  <span class="chip chip-failed">重复组 {{ task.duplicateGroups || 0 }}</span>
+                  <span class="chip chip-success">删除 {{ task.deletedFiles || 0 }}</span>
+                  <span class="chip">释放 {{ formatSize(task.freedBytes || 0) }}</span>
+                </template>
               </div>
 
               <div v-if="!expanded[task.id] && taskLatestLog(task)" class="task-latest-log" :title="taskLatestLog(task)">
@@ -4234,6 +4429,17 @@ const PageArchive = {
       loading.value = false;
     }
 
+    async function startDedup() {
+      if (!s.settings.outputPath) {
+        s.showToast('请先设置下载目录');
+        return;
+      }
+      s.showToast('开始去重', 2000);
+      s.currentPage = 'tasks';
+      await nextTick();
+      await s.startDedupTask(s.settings.outputPath);
+    }
+
     const authors = computed(() => {
       const map = new Map();
       s.archive.forEach(item => {
@@ -4281,7 +4487,7 @@ const PageArchive = {
       if (reportFormats.value.excel) formats.push('excel');
       if (reportFormats.value.html) formats.push('html');
       if (formats.length === 0) {
-        alert('请至少选择一种导出格式');
+        s.showToast('请至少选择一种导出格式');
         return;
       }
       s.exportReport({
@@ -4296,7 +4502,7 @@ const PageArchive = {
     }
 
     return {
-      s, loading, refresh, search, sortKey, authorFilter, dateFilter,
+      s, loading, refresh, startDedup, search, sortKey, authorFilter, dateFilter,
       authors, filteredArchive, previewVideo, openVideo, closeVideo: closePreview,
       showReportModal, reportDateFrom, reportDateTo,
       reportGroupBy, reportFormats, exportReport,
@@ -4306,8 +4512,9 @@ const PageArchive = {
     <div class="page-header">
       <div class="page-label">Archive</div>
       <h1>作品档案</h1>
-      <div class="sync-bar" style="margin-left:auto;width:auto;gap:12px;background:transparent;border:none;padding:0">
+      <div class="sync-bar" style="margin-left:auto;width:auto;gap:8px;justify-content:flex-start;background:transparent;border:none;padding:0">
         <button class="btn" @click="refresh" :disabled="loading"><span v-html="$icons.refresh"></span> 刷新</button>
+        <button class="btn" @click="startDedup"><span v-html="$icons.copy"></span> 作品去重</button>
         <button class="btn" @click="showReportModal=true"><span v-html="$icons.chart"></span> 导出报表</button>
       </div>
     </div>
@@ -4458,7 +4665,7 @@ const PageSettings = {
 
     function runRestore() {
       if (!restoreToken.value.trim()) {
-        alert('请输入恢复 Token');
+        s.showToast('请输入恢复 Token');
         return;
       }
       s.restoreCloud(restoreToken.value.trim());
@@ -4512,6 +4719,10 @@ const PageSettings = {
         <div class="setting-row">
           <label>重试次数</label><input type="number" v-model.number="s.settings.retryTimes" min="0" max="10" />
         </div>
+        <div class="setting-row">
+          <label>单链接最大运行时间（分钟）</label><input type="number" v-model.number="s.settings.queueUrlMaxRuntimeMinutes" min="1" max="180" />
+        </div>
+        <p class="settings-desc">单个链接（如一个博主主页）的下载任务超过该时间会被强制终止。低速拉取规避风控时可适当调大。</p>
         <div class="setting-row">
           <label>代理</label><input v-model="s.settings.proxy" placeholder="http://127.0.0.1:7890" />
         </div>
@@ -4567,7 +4778,7 @@ const PageSettings = {
       </div>
       <div class="settings-card">
         <h3>浏览器回补</h3>
-        <p class="settings-desc">当接口被限制时，用浏览器滚动作者主页兜底采集。开启「无头模式」后窗口不可见，遇到验证码将无法人工验证。</p>
+        <p class="settings-desc">当接口被限制时，用浏览器滚动作者主页兜底采集（仅用于批量关注/取关等关系操作，博主作品列表拉取已改为低速重试，不再使用浏览器兜底）。开启「无头模式」后窗口不可见，遇到验证码将无法人工验证。</p>
         <div class="setting-row setting-row--two-col">
           <label class="setting-check">
             <input type="checkbox" v-model="s.settings.browserFallback.enabled" />
@@ -4714,6 +4925,10 @@ const app = createApp({
       cleanupFns.push(window.electronAPI.onCloudLog(store.onCloudLog));
       cleanupFns.push(window.electronAPI.onCloudFinished(store.onCloudFinished));
 
+      cleanupFns.push(window.electronAPI.onDedupProgress(store.onDedupProgress));
+      cleanupFns.push(window.electronAPI.onDedupLog(store.onDedupLog));
+      cleanupFns.push(window.electronAPI.onDedupFinished(store.onDedupFinished));
+
       cleanupFns.push(window.electronAPI.onUserWorksProgress(store.onUserWorksProgress));
       cleanupFns.push(window.electronAPI.onUserWorksLog(store.onUserWorksLog));
       cleanupFns.push(window.electronAPI.onUserWorksFinished(store.onUserWorksFinished));
@@ -4741,6 +4956,7 @@ const app = createApp({
           store.relationTasks.filter(t => t.status === 'running').forEach(t => store.cancelRelationTask(t.id));
           store.reportTasks.filter(t => t.status === 'running').forEach(t => store.cancelReport(t.id));
           store.cloudTasks.filter(t => t.status === 'running').forEach(t => store.cancelCloud(t.id));
+          store.dedupTasks.filter(t => t.status === 'running').forEach(t => store.cancelDedupTask(t.id));
           store.userWorks.filter(t => t.status === 'running').forEach(t => store.cancelUserWorks(t.id));
           if (store.newReleases.status === 'running') store.cancelNewReleases();
         }

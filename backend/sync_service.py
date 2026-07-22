@@ -228,14 +228,33 @@ def _format_user(item: dict) -> dict:
 
 
 def _merge_aweme_count(existing: dict, new: dict) -> None:
-    """合并作品数：如果新数据只拿到 video_count（仅视频数），而本地已有更可靠的总作品数，保留本地值。"""
+    """合并作品数：优先保留更可靠的总作品数，并在数字变化时触发重新补全。"""
     new_extra = _parse_extra(new.get("extra"))
-    if new_extra.get("aweme_count_source") != "video_count":
-        return
+    new_source = new_extra.get("aweme_count_source")
     if not existing.get("aweme_count"):
         return
     old_extra = _parse_extra(existing.get("extra"))
-    if old_extra.get("aweme_count_source") in ("aweme_count", "profile_api"):
+    old_source = old_extra.get("aweme_count_source")
+
+    # 已经通过主页接口确认过的数据最可靠；如果关注列表接口给出的数字发生变化，
+    # 说明博主可能发布了新作品或删除了旧作品，需要重新用主页接口确认。
+    if old_source == "profile_api" and new_source in ("aweme_count", "video_count", "unknown"):
+        new_aweme_count = int(new.get("aweme_count") or 0)
+        old_aweme_count = int(existing.get("aweme_count") or 0)
+        if new_aweme_count and new_aweme_count != old_aweme_count:
+            # 数字发生变化，降级为 aweme_count 来源以便再次走主页接口补全
+            new_extra["aweme_count_source"] = "aweme_count"
+            new["extra"] = new_extra
+            return
+        # 数字没变化，保留主页接口确认过的值，避免被关注列表接口的缓存/子集覆盖
+        new["aweme_count"] = existing["aweme_count"]
+        new["video_count"] = existing.get("video_count", new.get("video_count"))
+        new["extra"] = old_extra
+        return
+
+    if new_source != "video_count":
+        return
+    if old_source in ("aweme_count", "profile_api"):
         new["aweme_count"] = existing["aweme_count"]
         new["video_count"] = existing.get("video_count", new.get("video_count"))
         new["extra"] = old_extra
@@ -463,12 +482,11 @@ class SyncService:
     ) -> int:
         """用用户主页接口补全关注列表中的作品数。
 
-        抖音关注列表接口有时会返回 ``video_count``（仅视频数）或把 ``aweme_count``
-        漏掉/置 0，导致前端把视频数当成全部作品数。``/aweme/v1/web/user/profile/other/``
-        能拿到准确的总作品数，因此对以下情况都用主页接口补全：
-        - ``aweme_count`` 为 0；
-        - 原数据里的 ``aweme_count`` 实际来自 ``video_count``（仅视频数）。
-        补全后更新 extra 标记来源，避免重复调用。
+        抖音关注列表接口返回的 ``aweme_count`` 可能只是公开/可见作品数、缓存值或子集，
+        并不总是准确的总作品数。``/aweme/v1/web/user/profile/other/`` 能拿到更可靠的
+        总作品数，因此只要本地记录还没有通过主页接口确认过（即 ``aweme_count_source``
+        不是 ``profile_api``），都会调用主页接口补全。补全后更新 ``extra`` 标记来源，
+        后续同步不再重复请求。
         """
 
         def _needs_enrich(it: dict) -> bool:
@@ -479,13 +497,9 @@ class SyncService:
                 return False
             if not it.get("aweme_count"):
                 return True
-            # 来源为空/未知、只拿到 video_count，或者 aweme_count 与 video_count 相同
-            #（关注列表接口的 aweme_count 有时实际只统计视频），都需要用主页接口确认。
-            if source in (None, "unknown", "video_count"):
-                return True
-            if source == "aweme_count" and it.get("aweme_count") == extra.get("video_count"):
-                return True
-            return False
+            # 关注列表接口返回的 aweme_count 可能只是公开/可见作品数、缓存值或子集，
+            # 只要不是已经通过主页接口确认过的，都用主页接口重新补全，确保数字准确。
+            return True
 
         enrich_targets = [
             (sec, it)
@@ -665,18 +679,19 @@ class SyncService:
     async def sync_likes(self, limit: int = 1000) -> dict:
         cache_path = self._cache_path("likes")
         cache = _load_cache(cache_path)
-        items: List[dict] = list(cache.get("items", []))
-        existing_ids = {i.get("aweme_id") for i in items if i.get("aweme_id")}
-        db_items: List[dict] = []
+        # 旧缓存/数据库里的顺序不可信（可能来自上次有 bug 的同步），
+        # 只用来收集已有作品数据（去重、合并字段、识别新增），最终顺序由本次 API 返回决定。
+        existing_items: Dict[str, dict] = {}
+        for it in cache.get("items", []):
+            aid = it.get("aweme_id")
+            if aid:
+                existing_items[aid] = it
 
-        # 初始化数据库；若 JSON 缓存为空，用数据库历史数据回填，避免重复拉取。
-        # 数据库中的数据按 download_time 排序，不代表点赞顺序，因此单独保存，
-        # 待接口数据拉取完毕后再合并到末尾，避免打乱"最新点赞在前"的顺序。
+        db_items: List[dict] = []
         await self._init_database()
-        if not items and self.database:
+        if self.database:
             try:
                 db_rows = await self.database.get_aweme_rows_by_type("like")
-                existing_ids = set()
                 for row in db_rows:
                     meta = row.get("metadata")
                     if meta:
@@ -694,14 +709,16 @@ class SyncService:
                             },
                         }
                     if item.get("aweme_id"):
-                        existing_ids.add(item["aweme_id"])
                         db_items.append(item)
-                # 按上一次同步保存的 like_order 排序，like_order 越小表示点赞越新
-                db_items.sort(key=lambda x: x.get("like_order", float("inf")))
+                        existing_items[item["aweme_id"]] = item
             except Exception as exc:
                 logging.warning("SyncService 从数据库加载喜欢列表失败: %s", exc)
 
-        emit("sync_start", kind="likes", cached=len(items), limit=limit)
+        # 最终列表：由本次 API 返回顺序填充，最新点赞在前。
+        items: List[dict] = []
+        existing_ids = set(existing_items.keys())
+
+        emit("sync_start", kind="likes", cached=len(existing_ids), limit=limit)
 
         sec_uid = "self"
         # 喜欢列表按时间倒序排列，新内容永远在 cursor=0 的最前面。
@@ -744,10 +761,9 @@ class SyncService:
                 for it in page_items:
                     fetched_ids.add(it["aweme_id"])
                     if it["aweme_id"] not in existing_ids:
-                        existing_ids.add(it["aweme_id"])
-                        new_items.append(it)
-                        pending_db_items.append(it)
                         added += 1
+                    new_items.append(it)
+                    pending_db_items.append(it)
 
                 # Douyin 喜欢接口按点赞时间倒序返回（cursor=0 是最新的），
                 # 因此把后续页追加到列表末尾即可保持“最新在前”。
@@ -767,9 +783,11 @@ class SyncService:
                 cursor = next_cursor
                 await self.rate_limiter.acquire()
 
-        # 把数据库回填的旧数据中、本次接口未返回的作品追加到末尾。
+        # 把本地有但本次接口未返回的作品追加到末尾。
         # 这些通常是已经被删除或不在前 limit 条中的作品，保持最新在前的顺序。
-        items = items + [it for it in db_items if it.get("aweme_id") not in fetched_ids]
+        for it in existing_items.values():
+            if it.get("aweme_id") and it["aweme_id"] not in fetched_ids:
+                items.append(it)
 
         # 将本次同步未返回的作品标记为失效（被博主删除），已返回的清除失效标记。
         # 仅对实际参与本次同步的前 limit 条记录做判断，超出 limit 未拉取的部分保持原状态。

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import io
 import json
 import logging
 import sys
@@ -19,6 +20,24 @@ import aiohttp
 
 from lib.bridge import BridgeContext, BridgeOutput, safe_main
 from lib.compat import ensure_backend_path
+
+
+def _ensure_utf8_stdio() -> None:
+    """强制 stdout/stderr 使用 UTF-8，避免中文在 Windows 打包环境下被 GBK 编码导致乱码。"""
+    try:
+        if getattr(sys.stdout, "buffer", None) and sys.stdout.encoding != "utf-8":
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", line_buffering=True
+            )
+        if getattr(sys.stderr, "buffer", None) and sys.stderr.encoding != "utf-8":
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", line_buffering=True
+            )
+    except Exception:
+        pass
+
+
+_ensure_utf8_stdio()
 
 ensure_backend_path()
 
@@ -39,8 +58,6 @@ _current_reporter: contextvars.ContextVar["ProgressReporter | None"] = contextva
 # 静默原本输出到 stderr 的进度日志，由 Electron 通过 stdout 事件转发。
 set_console_log_level(logging.CRITICAL)
 
-# 单个链接/作品下载的最长等待时间，防止网络层无限挂起。
-PER_URL_TIMEOUT_SECONDS = 300
 # 心跳间隔，必须小于主进程 DOWNLOAD_STALL_MS，保证看门狗不会误判卡死。
 HEARTBEAT_INTERVAL_SECONDS = 25
 
@@ -335,6 +352,18 @@ async def _download_direct_audio(
     return {"total": 1, "success": 1, "failed": 0, "skipped": 0}
 
 
+def _per_url_timeout_seconds(job: dict[str, Any]) -> int:
+    """从任务配置读取单链接最大运行时间（分钟），默认 30 分钟。"""
+    minutes = job.get("perUrlTimeoutMinutes")
+    if minutes is None:
+        minutes = 30
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        minutes = 30
+    return max(1, minutes) * 60
+
+
 async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> None:
     urls = _normalize_urls(job)
     if not urls:
@@ -343,6 +372,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
     config = _build_config(job)
     cookie_manager = _build_cookie_manager(job, config)
     database = await _init_database(config)
+    per_url_timeout_seconds = _per_url_timeout_seconds(job)
 
     total_success = 0
     total_failed = 0
@@ -381,7 +411,7 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
                         progress_reporter=reporter,
                     )
                 result = await asyncio.wait_for(
-                    download_coro, timeout=PER_URL_TIMEOUT_SECONDS
+                    download_coro, timeout=per_url_timeout_seconds
                 )
                 if is_music_context and _is_direct_audio_url(url):
                     result = SimpleNamespace(**result)
@@ -418,7 +448,8 @@ async def _run(ctx: BridgeContext, job: dict[str, Any], out: BridgeOutput) -> No
                     total_failed += 1
             except asyncio.TimeoutError:
                 logging.exception("下载超时：%s", url)
-                reason = f"单链接处理超过 {PER_URL_TIMEOUT_SECONDS} 秒，已自动跳过"
+                timeout_minutes = per_url_timeout_seconds // 60
+                reason = f"单链接处理超过 {timeout_minutes} 分钟，已自动跳过"
                 out.log(f"下载失败：{reason}", level="error")
                 out.emit("url_error", data={"url": url, "message": reason})
                 out.emit(
