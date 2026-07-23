@@ -436,7 +436,13 @@ store.loginWithBrowser = async () => {
   if (result.success && result.cookieString) {
     store.settings.cookieString = result.cookieString;
     await store.saveSettings();
-    await store.checkAuth();
+    // 后端已经在登录窗口里校验过 cookie 并返回用户信息，避免再发起一次校验导致等待
+    if (result.user && result.user.sec_uid) {
+      store.user = { ...result.user, isLoggedIn: true };
+      store.authChecked = true;
+    } else {
+      await store.checkAuth();
+    }
     if (store.user.isLoggedIn) {
       await store.loadArchive();
       await store.loadSyncCache('favorites');

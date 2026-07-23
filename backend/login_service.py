@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +43,7 @@ def parse_cookies(raw) -> dict:
 
 
 async def validate(cookie_raw: str, profile: Optional[str] = None):
+    start_ts = time.time()
     cookies = parse_cookies(cookie_raw)
     if not cookies:
         emit({"valid": False, "reason": "Cookie 为空"})
@@ -56,12 +58,15 @@ async def validate(cookie_raw: str, profile: Optional[str] = None):
         return
 
     try:
+        api_start = time.time()
         async with DouyinAPIClient(cookie_manager.get_cookies()) as api:
             user = await api.get_self_info()
+            api_ms = int((time.time() - api_start) * 1000)
             if not user or not user.get("sec_uid"):
-                emit({"valid": False, "reason": "无法获取用户信息，Cookie 可能已过期"})
+                emit({"valid": False, "reason": f"无法获取用户信息，Cookie 可能已过期（API 耗时 {api_ms}ms）"})
                 return
             normalized = FollowingUser.from_api(user)
+            total_ms = int((time.time() - start_ts) * 1000)
             emit({
                 "valid": True,
                 "user": {
@@ -70,6 +75,8 @@ async def validate(cookie_raw: str, profile: Optional[str] = None):
                     "avatar": normalized.avatar,
                     "unique_id": normalized.unique_id or user.get("unique_id", ""),
                 },
+                "elapsed_ms": total_ms,
+                "api_ms": api_ms,
             })
     except Exception as exc:
         emit({"valid": False, "reason": f"校验失败：{exc}"})

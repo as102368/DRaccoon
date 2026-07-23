@@ -1975,8 +1975,8 @@ async function validateCookiesWithBackend(cookieString) {
       } catch (e) {
         // ignore
       }
-      resolve({ valid: false, reason: '校验脚本执行超时（15 秒）' });
-    }, 15000);
+      resolve({ valid: false, reason: '校验脚本执行超时（45 秒），请检查网络或关闭代理后重试' });
+    }, 45000);
 
     proc.stdout.on('data', (data) => {
       pipeStdout += data.toString('utf-8');
@@ -2162,6 +2162,7 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
         }
         const cookieString = cookiesToString(cookies);
         console.log('正在后端校验 cookies...');
+        showLoginToast('正在向抖音校验登录状态，请稍候…', 'warning');
         const result = await validateCookiesWithBackend(cookieString);
         if (result.valid) {
           console.log('Cookie 校验通过，用户:', result.user ? result.user.nickname : 'unknown');
