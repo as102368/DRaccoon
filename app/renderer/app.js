@@ -188,11 +188,12 @@ const defaultSettings = {
   videoQuality: 'highest',
   queueUrlMaxRuntimeMinutes: 30,
   syncLimits: {
-    favorites: 1000,
-    collections: 200,
-    likes: 1000,
-    following: 2000,
-    topics: 200,
+    favorites: 50000,
+    collections: 50000,
+    likes: 50000,
+    following: 50000,
+    topics: 50000,
+    favoritesMusic: 50000,
     newReleasesAuthors: 200,
     newReleasesPerAuthor: 30,
     newReleasesAuthorSource: 'downloaded',
@@ -436,12 +437,15 @@ store.loginWithBrowser = async () => {
   if (result.success && result.cookieString) {
     store.settings.cookieString = result.cookieString;
     await store.saveSettings();
-    // 后端已经在登录窗口里校验过 cookie 并返回用户信息，避免再发起一次校验导致等待
     if (result.user && result.user.sec_uid) {
+      // 后端已完成校验并返回用户信息
       store.user = { ...result.user, isLoggedIn: true };
       store.authChecked = true;
     } else {
-      await store.checkAuth();
+      // 扫码后快速完成：立即显示已登录，后台异步获取用户信息
+      store.user = { isLoggedIn: true, nickname: '加载中...', avatar: '', sec_uid: '', unique_id: '' };
+      store.authChecked = true;
+      store.checkAuth().catch((e) => console.error('后台获取用户信息失败', e));
     }
     if (store.user.isLoggedIn) {
       await store.loadArchive();
@@ -1169,6 +1173,7 @@ store.onNewReleasesProgress = (payload) => {
     if (data.items) store.newReleases.items = data.items;
     store.loadSyncCache('new_releases');
     if (sync) {
+      if (store.newReleases.status !== 'cancelling') sync.status = 'success';
       sync.total = data.authors_checked || 0;
       sync.added = data.total || 0;
       sync.progress = 100;
@@ -2873,7 +2878,7 @@ const PageFavorites = {
           s.showToast('请输入话题 ID 或抖音话题链接');
           return;
         }
-        const limit = Math.max(1, Math.min(2000, parseInt(s.settings.syncLimits.topics, 10) || 200));
+        const limit = Math.max(1, Math.min(50000, parseInt(s.settings.syncLimits.topics, 10) || 200));
         const options = { limit, sortStrategy: topicSortStrategy.value };
         s.startSync(currentTab.value.kind, subKind, query, options);
       } else {
@@ -2892,7 +2897,7 @@ const PageFavorites = {
       if (activeTab.value === 'favorites' && activeSubTab.value === 'topics') {
         const query = topicQuery.value.trim() || (topicsCache.value.topic?.query);
         if (query) {
-          const limit = Math.max(1, Math.min(2000, parseInt(s.settings.syncLimits.topics, 10) || 200));
+          const limit = Math.max(1, Math.min(50000, parseInt(s.settings.syncLimits.topics, 10) || 200));
           const options = { limit, sortStrategy: topicSortStrategy.value };
           s.startSync(currentTab.value.kind, subKind, query, options);
         }
@@ -3146,11 +3151,12 @@ const PageFavorites = {
         <div class="drawer-section">
           <div class="drawer-section-title"><span class="dot dot-accent"></span>SYNC LIMITS</div>
           <p>每次同步从抖音拉取的最大条数。数值越大同步越慢。</p>
-          <div class="drawer-row"><span>我的收藏（视频）<br><small>1–10,000</small></span><input type="number" v-model.number="s.settings.syncLimits.favorites" min="1" max="10000" /></div>
-          <div class="drawer-row"><span>我收藏的合集<br><small>1–2,000</small></span><input type="number" v-model.number="s.settings.syncLimits.collections" min="1" max="2000" /></div>
-          <div class="drawer-row"><span>收藏音乐<br><small>1–10,000</small></span><input type="number" v-model.number="s.settings.syncLimits.favoritesMusic" min="1" max="10000" /></div>
-          <div class="drawer-row"><span>我的喜欢<br><small>1–10,000</small></span><input type="number" v-model.number="s.settings.syncLimits.likes" min="1" max="10000" /></div>
-          <div class="drawer-row"><span>话题视频<br><small>1–2,000</small></span><input type="number" v-model.number="s.settings.syncLimits.topics" min="1" max="2000" /></div>
+          <div class="drawer-row"><span>我的收藏（视频）<br><small>1–50,000</small></span><input type="number" v-model.number="s.settings.syncLimits.favorites" min="1" max="50000" /></div>
+          <div class="drawer-row"><span>我收藏的合集<br><small>1–50,000</small></span><input type="number" v-model.number="s.settings.syncLimits.collections" min="1" max="50000" /></div>
+          <div class="drawer-row"><span>收藏音乐<br><small>1–50,000</small></span><input type="number" v-model.number="s.settings.syncLimits.favoritesMusic" min="1" max="50000" /></div>
+          <div class="drawer-row"><span>我的喜欢<br><small>1–50,000</small></span><input type="number" v-model.number="s.settings.syncLimits.likes" min="1" max="50000" /></div>
+          <div class="drawer-row"><span>关注博主<br><small>1–50,000</small></span><input type="number" v-model.number="s.settings.syncLimits.following" min="1" max="50000" /></div>
+          <div class="drawer-row"><span>话题视频<br><small>1–50,000</small></span><input type="number" v-model.number="s.settings.syncLimits.topics" min="1" max="50000" /></div>
         </div>
         <div class="drawer-section">
           <div class="drawer-section-title"><span class="dot dot-purple"></span>RETENTION</div>

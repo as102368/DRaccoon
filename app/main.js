@@ -9,6 +9,7 @@ const {
   globalShortcut,
   clipboard,
   nativeImage,
+  session,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -334,12 +335,12 @@ const defaultSettings = {
   videoQuality: 'highest',
   queueUrlMaxRuntimeMinutes: 30,
   syncLimits: {
-    favorites: 1000,
-    collections: 200,
-    likes: 1000,
-    favoritesMusic: 1000,
-    following: 2000,
-    topics: 200,
+    favorites: 50000,
+    collections: 50000,
+    likes: 50000,
+    favoritesMusic: 50000,
+    following: 50000,
+    topics: 50000,
     newReleasesAuthors: 200,
     newReleasesPerAuthor: 30,
   },
@@ -1909,8 +1910,8 @@ function cookiesToString(cookies) {
 
 function hasLoginCookies(cookies) {
   const names = new Set(cookies.map((c) => c.name));
-  // sessionid 是已登录的最直接标志；扫码登录后可能先拿到 ttwid + passport_csrf_token
-  return names.has('sessionid') || (names.has('passport_csrf_token') && names.has('ttwid'));
+  // 只有 sessionid 是真正代表已登录的 cookie；ttwid/passport_csrf_token 在登录页就会写入，不能作为登录标志
+  return names.has('sessionid');
 }
 
 async function validateCookiesWithBackend(cookieString) {
@@ -2049,6 +2050,51 @@ async function getDouyinCookies(session) {
   return Array.from(map.values());
 }
 
+let loginCookieChangedHandler = null;
+let loginCookieDebounceTimer = null;
+
+function clearLoginCookieListener(loginWin) {
+  if (loginCookieDebounceTimer) {
+    clearTimeout(loginCookieDebounceTimer);
+    loginCookieDebounceTimer = null;
+  }
+  if (loginCookieChangedHandler && loginWin && !loginWin.isDestroyed()) {
+    try {
+      loginWin.webContents.session.cookies.off('changed', loginCookieChangedHandler);
+    } catch (e) {
+      // ignore
+    }
+    loginCookieChangedHandler = null;
+  }
+}
+
+function setupLoginCookieListener(loginWin, onLoginCookies) {
+  clearLoginCookieListener(loginWin);
+
+  const handler = (_event, cookie, _cause, removed) => {
+    if (removed) return;
+    if (!isDouyinDomain(cookie.domain)) return;
+    if (cookie.name !== 'sessionid') return;
+
+    if (loginCookieDebounceTimer) clearTimeout(loginCookieDebounceTimer);
+    loginCookieDebounceTimer = setTimeout(async () => {
+      if (loginWin.isDestroyed()) return;
+      try {
+        const cookies = await getDouyinCookies(loginWin.webContents.session);
+        if (hasLoginCookies(cookies)) {
+          clearLoginCookieListener(loginWin);
+          onLoginCookies(cookies);
+        }
+      } catch (e) {
+        console.error('cookie 变化检测失败', e);
+      }
+    }, 500);
+  };
+
+  loginCookieChangedHandler = handler;
+  loginWin.webContents.session.cookies.on('changed', handler);
+}
+
 // 登录窗口内注入的"完成登录"按钮脚本
 const LOGIN_BUTTON_SCRIPT = `
 (function() {
@@ -2098,12 +2144,15 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
   }
 
   return new Promise((resolve) => {
+    // 每次登录使用独立的全新 session，避免旧账号 cookie 残留导致自动误判已登录
+    const loginPartition = `login-${Date.now()}`;
     const loginWin = new BrowserWindow({
       width: 960,
       height: 760,
       title: '登录抖音',
       icon: getWindowIconPath() || undefined,
       webPreferences: {
+        partition: loginPartition,
         preload: path.join(__dirname, 'login-preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
@@ -2155,8 +2204,7 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
           return;
         }
         if (!hasLoginCookies(cookies)) {
-          const missing = ['sessionid', 'ttwid', 'passport_csrf_token'].filter((k) => !cookieNames.includes(k));
-          showLoginToast(`检测到 ${cookieNames.length} 个 cookie，但缺少登录标识：${missing.join('、')}，请完成登录后再试`);
+          showLoginToast('检测到 cookie，但缺少登录标识 sessionid，请完成登录后再试');
           resetLoginButton();
           return;
         }
@@ -2183,6 +2231,7 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
     function finish(result) {
       if (resolved) return;
       resolved = true;
+      clearLoginCookieListener(loginWin);
       loginWindow = null;
       try {
         ipcMain.removeHandler('auth:completeLogin');
@@ -2191,6 +2240,15 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
       }
       if (!loginWin.isDestroyed()) loginWin.close();
       resolve(result);
+    }
+
+    async function quickFinish(cookies) {
+      if (resolved) return;
+      const cookieString = cookiesToString(cookies);
+      const cookieNames = cookies.map((c) => c.name).join(', ');
+      console.log('扫码登录快速完成，cookies:', cookieNames);
+      writeUnifiedCookies(cookieString);
+      finish({ success: true, cookieString });
     }
 
     loginWin.webContents.setUserAgent(
@@ -2272,9 +2330,16 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
 
     loginWin.webContents.on('did-navigate', (_event, url) => {
       console.log('登录窗口导航到:', url);
-      // 只有到达用户个人主页时才自动判定登录成功
+      // 到达用户个人主页说明已登录，快速完成（无需再调后端 API）
       if (DOUYIN_USER_URL_RE.test(url)) {
-        setTimeout(doCheckAndFinish, 1000);
+        setTimeout(async () => {
+          try {
+            const cookies = await getDouyinCookies(loginWin.webContents.session);
+            if (hasLoginCookies(cookies)) await quickFinish(cookies);
+          } catch (e) {
+            console.error('URL 自动检测登录失败', e);
+          }
+        }, 800);
       }
     });
 
@@ -2317,6 +2382,9 @@ ipcMain.handle('auth:loginWithBrowser', async () => {
       loginWindow = null;
       finish({ success: false, reason: '用户取消登录' });
     });
+
+    // 监听 cookie 变化：扫码登录成功后 cookie 写入时会自动触发快速完成
+    setupLoginCookieListener(loginWin, quickFinish);
 
     loginWin.loadURL(DOUYIN_LOGIN_URL);
   });
