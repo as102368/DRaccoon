@@ -1460,6 +1460,12 @@ class SyncService:
             pending_db_items: List[dict] = []
             DB_BATCH_SIZE = 100
 
+            # 抖音关注接口偶尔会返回空页但 has_more=true，若一直重试会卡住。
+            # 连续空页达到一定次数后视为已拉完，直接完成同步。
+            EMPTY_PAGE_THRESHOLD = 3
+            MAX_PAGES = 500
+            empty_page_count = 0
+
             while len(items) < limit:
                 page += 1
                 resp = await api.get_following_page(sec_uid, max_time=max_time, count=20)
@@ -1531,6 +1537,15 @@ class SyncService:
                     emit("sync_error", kind="following", message=f"获取关注列表失败：{status_code} {status_msg}".strip())
                     return cache
 
+                # 记录空页次数；连续空页达到阈值视为已拉完，避免在不够上限时卡住
+                if not page_items:
+                    empty_page_count += 1
+                else:
+                    empty_page_count = 0
+                if empty_page_count >= EMPTY_PAGE_THRESHOLD or page >= MAX_PAGES:
+                    drained = True
+                    break
+
                 if not has_more:
                     drained = True
                     break
@@ -1547,8 +1562,8 @@ class SyncService:
                 max_time = next_min_time
                 last_max_time = max_time
 
-                # 关注列表接口风控较严，分页间加短暂延迟；前 3 页快一些，后面更保守
-                delay = 0.4 if page <= 3 else 0.8
+                # 关注列表接口风控较严，分页间加短暂延迟；rate_limiter 已做限速，这里保持较小值即可
+                delay = 0.2 if page <= 3 else 0.4
                 await asyncio.sleep(delay)
 
             if pending_db_items and self.database:
@@ -1557,9 +1572,6 @@ class SyncService:
                 except Exception as exc:
                     logging.warning("SyncService 批量保存关注用户失败: %s", exc)
                 pending_db_items = []
-
-            # 关注列表接口返回的作品数偶尔为 0，用用户主页接口补全
-            await self._enrich_following_aweme_count(api, items_index)
 
         # 只有在完整跑完所有页时，才清理本地已不在关注列表中的记录
         if drained:
@@ -1579,7 +1591,7 @@ class SyncService:
         cache.update({"items": items[:limit], "updated_at": _now(), "count": len(items[:limit])})
         _save_cache(cache_path, cache)
 
-        # 先发送完成事件，再保存 cursor；避免 cursor 写入异常导致 UI 一直显示同步中
+        # 先发送完成事件，再保存 cursor 与补全作品数；避免这些耗时操作阻塞 UI 显示同步中
         emit("sync_done", kind="following", total=len(items[:limit]), added=added, drained=drained)
 
         # 同步完成则重置游标，下次从 newest 开始；未完成（中断/限流/达到上限）则保存断点便于续传
@@ -1587,6 +1599,14 @@ class SyncService:
             await self._set_cursor("following", sec_uid, 0)
         elif last_max_time > 0:
             await self._set_cursor("following", sec_uid, last_max_time)
+
+        # 关注列表接口返回的作品数偶尔为 0，用用户主页接口补全。
+        # 这一步只刷新本地数据，不阻塞同步完成事件，补全后再保存一次缓存。
+        enriched_count = await self._enrich_following_aweme_count(api, items_index)
+        if enriched_count > 0:
+            items.sort(key=lambda x: x.get("follow_order") if x.get("follow_order") is not None else float("inf"))
+            cache.update({"items": items[:limit], "updated_at": _now(), "count": len(items[:limit])})
+            _save_cache(cache_path, cache)
 
         return cache
 

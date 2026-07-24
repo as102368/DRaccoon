@@ -730,6 +730,7 @@ store.startSync = async (kind, subKind, query, options = {}) => {
     progress: 0,
     total: 0,
     added: 0,
+    drained: false,
     errorCount: 0,
     logs: [],
     createdAt: new Date(now).toLocaleString(),
@@ -826,6 +827,7 @@ store.onSyncProgress = (payload) => {
   } else if (data.event === 'sync_done') {
     sync.step = '同步完成';
     sync.progress = 100;
+    sync.drained = data.drained || false;
     if (data.kind) store.loadSyncCache(data.kind);
   } else if (data.event === 'sync_error') {
     sync.errorCount = (sync.errorCount || 0) + 1;
@@ -3767,7 +3769,10 @@ const PageTasks = {
       }
       if (task.id.startsWith('sync-')) {
         if (task.kind === 'newReleases') return `已检查博主 ${task.total || 0} · 新作品 ${task.added || 0}`;
-        return `目标 ${task.total || 0} · 已新增 ${task.added || 0}`;
+        if (task.status === 'success' || task.status === 'done' || task.status === 'completed' || task.drained) {
+          return `已完成 · 共 ${task.added || 0} 条`;
+        }
+        return `已拉取 ${task.added || 0} 条`;
       }
       if (task.id.startsWith('relation-')) return `${task.total || 0} 位用户`;
       if (task.id.startsWith('report-')) {
@@ -4347,8 +4352,14 @@ const PageTasks = {
                   <span class="chip">跳过 {{ task.skipped || 0 }}</span>
                 </template>
                 <template v-else-if="task.id.startsWith('sync-')">
-                  <span class="chip">目标 {{ task.total || 0 }}</span>
-                  <span class="chip chip-success">已新增 {{ task.added || 0 }}</span>
+                  <template v-if="task.status === 'success' || task.status === 'done' || task.status === 'completed' || task.drained">
+                    <span class="chip">已完成</span>
+                    <span class="chip chip-success">共 {{ task.added || 0 }} 条</span>
+                  </template>
+                  <template v-else>
+                    <span class="chip">上限 {{ task.total || 0 }}</span>
+                    <span class="chip chip-success">已拉取 {{ task.added || 0 }} 条</span>
+                  </template>
                 </template>
                 <template v-else-if="task.id.startsWith('relation-')">
                   <span class="chip">目标 {{ task.total || 0 }}</span>
